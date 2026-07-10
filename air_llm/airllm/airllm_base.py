@@ -120,7 +120,7 @@ class AirLLMBaseModel:
                  layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
                  live_stats_interval=0.25, cuda_copy_stream=True,
                  cpu_layer_cache_gib=0.0, persistent_gpu_residency=False,
-                 awq_backend=None):
+                 awq_backend=None, decoder_layer_count=None):
         """
         Parameters
         ----------
@@ -171,6 +171,11 @@ class AirLLMBaseModel:
             explicit GPTQModel kernel for an AWQ checkpoint. ``marlin`` requires persistent
             GPU residency because its one-time weight repack is not compatible with eviction
             and reloading raw AWQ layer shards.
+        decoder_layer_count: int, optional
+            experimental reduced-depth mode. Keep this many decoder layers, sampled evenly
+            across the original stack while retaining the first and last blocks. The retained
+            layers are compacted and their KV-cache indices are renumbered. Omitting this value
+            executes the complete checkpoint.
         """
 
         if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
@@ -186,6 +191,11 @@ class AirLLMBaseModel:
             raise ValueError("cpu_layer_cache_gib must be a non-negative number")
         if not isinstance(persistent_gpu_residency, bool):
             raise TypeError("persistent_gpu_residency must be a boolean")
+        if decoder_layer_count is not None and (
+                not isinstance(decoder_layer_count, int)
+                or isinstance(decoder_layer_count, bool)
+                or decoder_layer_count < 1):
+            raise ValueError("decoder_layer_count must be a positive integer or None")
         if awq_backend is not None:
             if not isinstance(awq_backend, str) or not awq_backend.strip():
                 raise TypeError("awq_backend must be a non-empty string or None")
@@ -216,6 +226,7 @@ class AirLLMBaseModel:
         self.prefetch_groups = prefetch_groups
         self.persistent_gpu_residency = persistent_gpu_residency
         self.awq_backend = awq_backend
+        self.requested_decoder_layer_count = decoder_layer_count
         self._quantizer_postprocess_started = False
         self._quantizer_postprocessed = False
 
@@ -292,15 +303,16 @@ class AirLLMBaseModel:
 
         self.init_model()
 
-        # compute layer count from the instantiated model
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        layers_count = len(model_attr)
+        self._configure_decoder_layer_selection()
 
         self.layer_names = [self.layer_names_dict['embed']] + \
-                           [f'{self.layer_names_dict["layer_prefix"]}.{i}' for i in range(layers_count)] + \
+                           [f'{self.layer_names_dict["layer_prefix"]}.{i}'
+                            for i in self.decoder_layer_indices] + \
                            [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
+        self.runtime_layer_names = [self.layer_names_dict['embed']] + \
+                                   [f'{self.layer_names_dict["layer_prefix"]}.{i}'
+                                    for i in range(self.decoder_layer_count)] + \
+                                   [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
 
         self.max_seq_len = max_seq_len
 
@@ -346,6 +358,107 @@ class AirLLMBaseModel:
         self.config.quantization_config = quantization_config
 
     # ---- model construction -----------------------------------------------------------------
+
+    @staticmethod
+    def _select_evenly_spaced_layers(original_count, selected_count):
+        """Return deterministic source indices, preserving both ends when possible."""
+        if not isinstance(original_count, int) or isinstance(original_count, bool) \
+                or original_count < 1:
+            raise ValueError("original decoder layer count must be a positive integer")
+        if selected_count is None:
+            selected_count = original_count
+        if not isinstance(selected_count, int) or isinstance(selected_count, bool) \
+                or selected_count < 1:
+            raise ValueError("decoder_layer_count must be a positive integer or None")
+        if selected_count > original_count:
+            raise ValueError(
+                f"decoder_layer_count={selected_count} exceeds the checkpoint's "
+                f"{original_count} decoder layers"
+            )
+        if selected_count == original_count:
+            return list(range(original_count))
+        if selected_count == 1:
+            return [original_count // 2]
+
+        # Integer round-half-up avoids floating-point drift and guarantees unique, ordered
+        # indices because the spacing is at least one whenever selected_count <= original_count.
+        denominator = selected_count - 1
+        rounding = denominator // 2
+        return [
+            (position * (original_count - 1) + rounding) // denominator
+            for position in range(selected_count)
+        ]
+
+    def _configure_decoder_layer_selection(self):
+        """Compact an evenly sampled decoder stack and repair cache/config indexing."""
+        prefix_parts = self.layer_names_dict["layer_prefix"].split(".")
+        parent = self.model
+        for attr_name in prefix_parts[:-1]:
+            parent = getattr(parent, attr_name)
+        layers_attr = prefix_parts[-1]
+        original_layers = getattr(parent, layers_attr)
+        original_count = len(original_layers)
+        selected_indices = self._select_evenly_spaced_layers(
+            original_count, self.requested_decoder_layer_count)
+
+        self.original_decoder_layer_count = original_count
+        self.decoder_layer_indices = selected_indices
+        self.decoder_layer_count = len(selected_indices)
+        if self.decoder_layer_count == original_count:
+            return
+
+        if not isinstance(original_layers, torch.nn.ModuleList):
+            raise TypeError(
+                "experimental reduced-depth mode requires decoder layers stored in "
+                "torch.nn.ModuleList"
+            )
+
+        layer_types = getattr(self.config, "layer_types", None)
+        if layer_types is not None:
+            if len(layer_types) != original_count:
+                raise ValueError(
+                    "experimental reduced-depth mode cannot safely compact a model whose "
+                    "config.layer_types length differs from num_hidden_layers"
+                )
+            self.config.layer_types = [layer_types[index] for index in selected_indices]
+
+        selected_layers = torch.nn.ModuleList(
+            [original_layers[index] for index in selected_indices]
+        )
+        setattr(parent, layers_attr, selected_layers)
+        self.config.num_hidden_layers = self.decoder_layer_count
+        self.model.config.num_hidden_layers = self.decoder_layer_count
+
+        # DynamicCache and StaticCache both expect compact zero-based layer indices. Attention
+        # implementations commonly store the source index on a nested module (Qwen uses
+        # self_attn.layer_idx), so update every integer marker inside each retained block.
+        for runtime_index, decoder_layer in enumerate(selected_layers):
+            for module in decoder_layer.modules():
+                if type(getattr(module, "layer_idx", None)) is int:
+                    module.layer_idx = runtime_index
+
+        selected_layer_types = getattr(self.config, "layer_types", None)
+        if hasattr(parent, "has_sliding_layers") and selected_layer_types is not None:
+            parent.has_sliding_layers = "sliding_attention" in selected_layer_types
+
+    def _remap_layer_state_dict(self, layer_index, state_dict):
+        """Map an original checkpoint layer prefix onto its compact runtime position."""
+        source_prefix = self.layer_names[layer_index]
+        runtime_prefix = self.runtime_layer_names[layer_index]
+        if source_prefix == runtime_prefix:
+            return state_dict
+
+        source_with_separator = source_prefix + "."
+        remapped = {}
+        for param_name, value in state_dict.items():
+            if param_name == source_prefix:
+                runtime_name = runtime_prefix
+            elif param_name.startswith(source_with_separator):
+                runtime_name = runtime_prefix + param_name[len(source_prefix):]
+            else:
+                runtime_name = param_name
+            remapped[runtime_name] = value
+        return remapped
 
     def init_model(self):
         # Build the real model on meta (no memory). include_buffers=False so non-persistent
@@ -652,7 +765,8 @@ class AirLLMBaseModel:
         try:
             for idx, state_dict in zip(expected_layers, state_dicts):
                 module = self.layers[idx]
-                module._airllm_moved = self.move_layer_to_device(state_dict)
+                runtime_state_dict = self._remap_layer_state_dict(idx, state_dict)
+                module._airllm_moved = self.move_layer_to_device(runtime_state_dict)
                 loaded_modules.append(module)
         except Exception:
             for module in loaded_modules:
@@ -975,6 +1089,9 @@ class AirLLMBaseModel:
         return {
             **self._runtime_stats,
             "forward_passes": self._forward_count,
+            "original_decoder_layer_count": self.original_decoder_layer_count,
+            "decoder_layer_count": self.decoder_layer_count,
+            "decoder_layer_indices": list(self.decoder_layer_indices),
             "layers_per_gpu_group": self.layers_per_gpu_group,
             "prefetch_groups": self.prefetch_groups,
             "cuda_copy_stream": self.cuda_copy_stream,

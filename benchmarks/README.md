@@ -14,9 +14,13 @@ The harness supports:
 - `--persistent-gpu-residency` to preload and retain every group when the full
   model fits, plus `--awq-backend` for an explicit AWQ kernel such as Marlin.
 - `--cache-implementation` for realistic dynamic, static, or offloaded KV caches.
+- `--decoder-layer-count` for an explicitly quality-sacrificing, evenly sampled
+  reduced-depth run. The JSON records both the source indices and active count.
 - `--prompt-file` with one prompt per non-empty UTF-8 line, or repeat `--prompt`
   and use `--prompt-repeats` for repeated prompt batches.
-- `--prompt-batch-size`, `--max-new-tokens`, `--warmup`, and `--repeats`.
+- `--prompt-batch-size`, `--max-new-tokens`, `--min-new-tokens`, `--warmup`, and
+  `--repeats`. Set minimum equal to maximum to prevent early EOS from shortening
+  a throughput comparison.
 - CSV and JSON output with TPS, TTFT, latency, GPU utilization, power,
   temperature, VRAM, cache hits, CPU wait, CUDA-copy wait, and compute time.
 
@@ -70,6 +74,26 @@ toolchain listed in the top-level README), add persistent residency and Marlin:
   --warmup 1 \
   --repeats 3
 ```
+
+To compare the full 36-layer checkpoint against half depth and one-third depth,
+run the same benchmark three times and force an equal decode length:
+
+```bash
+for layers in 36 18 12; do
+  ./scripts/run_qwen3_awq_marlin.sh --benchmark \
+    --decoder-layer-count "${layers}" \
+    --max-new-tokens 128 \
+    --min-new-tokens 128 \
+    --warmup 1 \
+    --repeats 3 \
+    --output-csv "benchmarks/results/reduced-depth-${layers}.csv" \
+    --output-json "benchmarks/results/reduced-depth-${layers}.json"
+done
+```
+
+The selected source-layer indices are printed at startup. Reduced depth is an
+inference experiment, not a distilled checkpoint: higher TPS does not imply that
+the resulting text preserves the original model's quality.
 
 On the tested 12 GB RTX 5070, the current branch measured the following local
 results. Generated result files remain gitignored by repository policy; rerun

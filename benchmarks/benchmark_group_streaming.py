@@ -110,6 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consecutive decoder layers kept resident in one GPU group.",
     )
     parser.add_argument(
+        "--decoder-layer-count",
+        type=positive_int,
+        default=None,
+        help=(
+            "Experimental reduced-depth mode: retain this many evenly spaced decoder "
+            "layers from the original checkpoint. Omit to run every layer."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-groups",
         type=positive_int,
         default=1,
@@ -184,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=32,
         help="Maximum number of new tokens generated per prompt.",
+    )
+    parser.add_argument(
+        "--min-new-tokens",
+        type=non_negative_int,
+        default=0,
+        help="Minimum generated tokens per prompt; set equal to max for fixed-length TPS runs.",
     )
     parser.add_argument(
         "--warmup",
@@ -492,6 +507,7 @@ def generate_once(
     encoded: dict[str, Any],
     device: Any,
     max_new_tokens: int,
+    min_new_tokens: int,
     cache_implementation: str,
 ) -> dict[str, float | int | None]:
     model_inputs = move_inputs(encoded, device)
@@ -518,6 +534,8 @@ def generate_once(
     }
     if tokenizer.pad_token_id is not None:
         generation_kwargs["pad_token_id"] = tokenizer.pad_token_id
+    if min_new_tokens:
+        generation_kwargs["min_new_tokens"] = min_new_tokens
 
     started = time.perf_counter()
     if gpu_monitor is not None:
@@ -621,6 +639,7 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "model_path": str(args.model_path.expanduser()),
         "device_requested": args.device,
         "group_size": args.group_size,
+        "decoder_layer_count": args.decoder_layer_count,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
@@ -633,6 +652,7 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "prompt_batch_count": len(batches),
         "padded_prompt_count": padded_count,
         "max_new_tokens": args.max_new_tokens,
+        "min_new_tokens": args.min_new_tokens,
         "warmup_runs": args.warmup,
         "repeats": args.repeats,
         "output_csv": str(args.output_csv),
@@ -643,6 +663,8 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.min_new_tokens > args.max_new_tokens:
+        raise SystemExit("--min-new-tokens cannot exceed --max-new-tokens")
     prompts, prompt_source = read_prompts(args)
     batches, padded_count = build_prompt_batches(prompts, args.prompt_batch_size)
 
@@ -664,6 +686,7 @@ def main() -> int:
     print(f"model_path: {model_path}")
     print(f"device: {device}")
     print(f"group_size: {args.group_size}")
+    print(f"decoder_layer_count: {args.decoder_layer_count or 'all'}")
     print(f"prefetch_groups: {args.prefetch_groups}")
     print(f"prefetching: {not args.no_prefetch}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
@@ -676,6 +699,7 @@ def main() -> int:
     model_kwargs: dict[str, Any] = {
         "device": str(device),
         "layers_per_gpu_group": args.group_size,
+        "decoder_layer_count": args.decoder_layer_count,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
@@ -686,6 +710,13 @@ def main() -> int:
     if args.layer_shards_path is not None:
         model_kwargs["layer_shards_saving_path"] = str(args.layer_shards_path.expanduser())
     model = AutoModel.from_pretrained(str(model_path), **model_kwargs)
+    initial_runtime_stats = model.get_runtime_stats()
+    print(
+        "active_decoder_layers: "
+        f"{initial_runtime_stats['decoder_layer_count']}/"
+        f"{initial_runtime_stats['original_decoder_layer_count']} "
+        f"source_indices={initial_runtime_stats['decoder_layer_indices']}"
+    )
     encoded_batches = tokenize_batches(model.tokenizer, batches, args.max_input_tokens)
 
     print(f"warmup_runs: {args.warmup}")
@@ -697,6 +728,7 @@ def main() -> int:
             encoded_batches[0],
             device,
             args.max_new_tokens,
+            args.min_new_tokens,
             args.cache_implementation,
         )
 
@@ -704,6 +736,9 @@ def main() -> int:
         "model_path": str(model_path),
         "device": str(device),
         "group_size": args.group_size,
+        "decoder_layer_count": initial_runtime_stats["decoder_layer_count"],
+        "original_decoder_layer_count": initial_runtime_stats["original_decoder_layer_count"],
+        "decoder_layer_indices": initial_runtime_stats["decoder_layer_indices"],
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
@@ -718,6 +753,7 @@ def main() -> int:
         "padded_prompt_count": padded_count,
         "max_input_tokens": args.max_input_tokens,
         "max_new_tokens": args.max_new_tokens,
+        "min_new_tokens": args.min_new_tokens,
         "warmup_runs": args.warmup,
         "repeats": args.repeats,
         "layer_shards_path": (
@@ -755,6 +791,7 @@ def main() -> int:
                 encoded,
                 device,
                 args.max_new_tokens,
+                args.min_new_tokens,
                 args.cache_implementation,
             )
             row = {

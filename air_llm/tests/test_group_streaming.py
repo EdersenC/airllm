@@ -3,11 +3,22 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from torch import nn
 
 from ..airllm.airllm_base import AirLLMBaseModel
 
 
 class TestGroupStreaming(unittest.TestCase):
+    class _IndexedModule(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.layer_idx = layer_idx
+
+    class _DecoderLayer(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.self_attn = TestGroupStreaming._IndexedModule(layer_idx)
+
     class _Executor:
         def __init__(self):
             self.submitted = []
@@ -108,6 +119,78 @@ class TestGroupStreaming(unittest.TestCase):
             with self.subTest(group_size=group_size):
                 with self.assertRaises(ValueError):
                     AirLLMBaseModel._build_streaming_groups(6, True, group_size)
+
+    def test_even_layer_selection_matches_half_and_third_qwen_stack(self):
+        self.assertEqual(
+            AirLLMBaseModel._select_evenly_spaced_layers(36, 18),
+            [0, 2, 4, 6, 8, 10, 12, 14, 16, 19, 21, 23, 25, 27, 29, 31, 33, 35],
+        )
+        self.assertEqual(
+            AirLLMBaseModel._select_evenly_spaced_layers(36, 12),
+            [0, 3, 6, 10, 13, 16, 19, 22, 25, 29, 32, 35],
+        )
+
+    def test_even_layer_selection_rejects_impossible_count(self):
+        with self.assertRaisesRegex(ValueError, "exceeds the checkpoint"):
+            AirLLMBaseModel._select_evenly_spaced_layers(12, 13)
+
+    def test_reduced_depth_compacts_layers_and_cache_indices(self):
+        model = object.__new__(AirLLMBaseModel)
+        decoder_layers = nn.ModuleList([self._DecoderLayer(index) for index in range(6)])
+        base_model = SimpleNamespace(layers=decoder_layers, has_sliding_layers=True)
+        config = SimpleNamespace(
+            num_hidden_layers=6,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+        )
+        model.model = SimpleNamespace(model=base_model, config=config)
+        model.config = config
+        model.layer_names_dict = {"layer_prefix": "model.layers"}
+        model.requested_decoder_layer_count = 3
+
+        model._configure_decoder_layer_selection()
+
+        self.assertEqual(model.original_decoder_layer_count, 6)
+        self.assertEqual(model.decoder_layer_indices, [0, 3, 5])
+        self.assertEqual(config.num_hidden_layers, 3)
+        self.assertEqual(
+            config.layer_types,
+            ["full_attention", "sliding_attention", "sliding_attention"],
+        )
+        self.assertEqual(
+            [layer.self_attn.layer_idx for layer in base_model.layers],
+            [0, 1, 2],
+        )
+        self.assertTrue(base_model.has_sliding_layers)
+
+    def test_reduced_depth_remaps_original_shard_to_runtime_layer(self):
+        model = object.__new__(AirLLMBaseModel)
+        model.layer_names = ["model.embed_tokens", "model.layers.0", "model.layers.35"]
+        model.runtime_layer_names = ["model.embed_tokens", "model.layers.0", "model.layers.1"]
+        tensor = torch.ones(1)
+
+        remapped = model._remap_layer_state_dict(
+            2,
+            {
+                "model.layers.35.self_attn.q_proj.qweight": tensor,
+                "model.layers.35.input_layernorm.weight": tensor,
+            },
+        )
+
+        self.assertEqual(
+            set(remapped),
+            {
+                "model.layers.1.self_attn.q_proj.qweight",
+                "model.layers.1.input_layernorm.weight",
+            },
+        )
+        self.assertIs(remapped["model.layers.1.input_layernorm.weight"], tensor)
 
     def test_awq_backend_override_is_copied_into_model_config(self):
         model = object.__new__(AirLLMBaseModel)

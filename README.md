@@ -270,6 +270,7 @@ When initialize the model, we support the following configurations:
 * **cpu_layer_cache_gib**: bounded CPU-RAM budget for retaining layer shards across autoregressive forwards. Use `0` to disable retention.
 * **persistent_gpu_residency**: preload every group once and retain the complete model across decode steps. This removes per-token weight transfers but requires the checkpoint and KV cache to fit in VRAM.
 * **awq_backend**: select a GPTQModel AWQ kernel explicitly. `marlin` requires persistent GPU residency because its one-time repacked weights cannot be streamed back from raw AWQ shards.
+* **decoder_layer_count**: experimental reduced-depth mode. Retain this many decoder blocks, sampled evenly across the original stack with compact KV-cache indexing. This can increase speed but substantially changes model quality; omit it for normal inference.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS

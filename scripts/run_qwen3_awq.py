@@ -25,10 +25,14 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=0,
                         help="Prompts per generate call; 0 means all prompts")
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--min-new-tokens", type=int, default=0,
+                        help="Minimum generated tokens; set equal to max for a fixed-length run")
     parser.add_argument("--max-input-tokens", type=int, default=512,
                         help="Tokenizer truncation limit for each prompt")
     parser.add_argument("--layers-per-gpu-group", type=int, default=1,
                         help="Consecutive decoder layers to keep on GPU at once")
+    parser.add_argument("--decoder-layer-count", type=int, default=None,
+                        help="Experimental count of evenly spaced decoder layers to retain")
     parser.add_argument("--prefetch-groups", type=int, default=1,
                         help="Upcoming GPU groups to cache in CPU memory")
     parser.add_argument("--cpu-layer-cache-gib", type=float, default=4.0,
@@ -129,6 +133,9 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         torch.cuda.synchronize()
     streamer = FirstTokenTimer()
     started = time.perf_counter()
+    generation_kwargs = {}
+    if args.min_new_tokens:
+        generation_kwargs["min_new_tokens"] = args.min_new_tokens
     output = model.generate(
         input_ids,
         attention_mask=attention_mask,
@@ -141,6 +148,7 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         disable_compile=True,
         streamer=streamer,
         return_dict_in_generate=True,
+        **generation_kwargs,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -205,6 +213,10 @@ def main():
         raise SystemExit("--max-input-tokens must be positive")
     if args.max_new_tokens < 1:
         raise SystemExit("--max-new-tokens must be positive")
+    if args.min_new_tokens < 0 or args.min_new_tokens > args.max_new_tokens:
+        raise SystemExit("--min-new-tokens must be between zero and --max-new-tokens")
+    if args.decoder_layer_count is not None and args.decoder_layer_count < 1:
+        raise SystemExit("--decoder-layer-count must be positive")
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     prompts = load_prompts(args)
@@ -212,6 +224,7 @@ def main():
     print(f"model: {args.model_cache}")
     print(f"device: {device}")
     print(f"layers_per_gpu_group: {args.layers_per_gpu_group}")
+    print(f"decoder_layer_count: {args.decoder_layer_count or 'all'}")
     print(f"prefetch_groups: {args.prefetch_groups}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
     print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
@@ -225,6 +238,7 @@ def main():
         str(args.model_cache),
         device=device,
         layers_per_gpu_group=args.layers_per_gpu_group,
+        decoder_layer_count=args.decoder_layer_count,
         prefetch_groups=args.prefetch_groups,
         cuda_copy_stream=not args.no_cuda_copy_stream,
         cpu_layer_cache_gib=args.cpu_layer_cache_gib,
@@ -233,6 +247,12 @@ def main():
         show_live_stats=not args.no_live_stats,
         live_stats_interval=args.live_stats_interval,
         layer_shards_saving_path=str(args.layer_shards_path) if args.layer_shards_path else None,
+    )
+    runtime_stats = model.get_runtime_stats()
+    print(
+        "active_decoder_layers: "
+        f"{runtime_stats['decoder_layer_count']}/{runtime_stats['original_decoder_layer_count']} "
+        f"source_indices={runtime_stats['decoder_layer_indices']}"
     )
     results = []
     for offset in range(0, len(prompts), batch_size):

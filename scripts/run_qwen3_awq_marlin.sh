@@ -70,6 +70,20 @@ if [[ "${1:-}" == "--context-limit-benchmark" ]]; then
         "$@"
 fi
 
+if [[ "${1:-}" == "--benchmark" ]]; then
+    shift
+    exec "${PYTHON}" "${ROOT_DIR}/benchmarks/benchmark_group_streaming.py" \
+        --model-path /mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ \
+        --device cuda:0 \
+        --layers-per-gpu-group 24 \
+        --prefetch-groups 8 \
+        --cpu-layer-cache-gib 16 \
+        --persistent-gpu-residency \
+        --awq-backend marlin \
+        --cache-implementation dynamic \
+        "$@"
+fi
+
 USE_PERSISTENT_RESIDENCY=true
 for argument in "$@"; do
     case "${argument}" in
