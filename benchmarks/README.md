@@ -95,6 +95,26 @@ The selected source-layer indices are printed at startup. Reduced depth is an
 inference experiment, not a distilled checkpoint: higher TPS does not imply that
 the resulting text preserves the original model's quality.
 
+### Reduced-depth Qwen3-4B-AWQ result
+
+On the RTX 5070, a clean-revision comparison used batch 1, persistent Marlin,
+dynamic KV cache, one warmup, three measured runs, and exactly 128 generated
+tokens per run (`min_new_tokens == max_new_tokens`).
+
+| Active decoder layers | Mean throughput | Speedup vs. 36 | Peak allocation | Prompt sanity |
+| ---: | ---: | ---: | ---: | --- |
+| 36 / 36 | 10.60 tok/s | 1.00x | 2,611 MiB | Baseline remained recognizable |
+| 18 / 36 | 22.51 tok/s | 2.12x | 1,691 MiB | Failed simple factual prompts |
+| 12 / 36 | **28.19 tok/s** | **2.66x** | **1,385 MiB** | Failed simple factual prompts |
+
+The 12-layer configuration is the raw-TPS winner, but neither reduced stack is a
+usable replacement for the original checkpoint without distillation or further
+layer-selection/quality work. The 36-layer configuration remains the fastest one
+that passed the basic output sanity check. The measured source indices were:
+
+- 18 layers: `0,2,4,6,8,10,12,14,16,19,21,23,25,27,29,31,33,35`
+- 12 layers: `0,3,6,10,13,16,19,22,25,29,32,35`
+
 On the tested 12 GB RTX 5070, the current branch measured the following local
 results. Generated result files remain gitignored by repository policy; rerun
 the commands above to regenerate them. New JSON/CSV configuration records include
