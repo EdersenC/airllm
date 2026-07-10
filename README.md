@@ -96,13 +96,17 @@ Then run the model from the Windows `S:` drive mounted in WSL:
 
 The script defaults to `/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ` and automatically resolves its Hugging Face cache snapshot. Pass `--prompt "your prompt"` to try another prompt.
 
-To keep two decoder layers on the GPU at a time, cache the next two decoder layers in CPU memory, and show live layer progress:
+For the tested 12 GB RTX 5070 setup, keep 24 decoder layers resident, retain the
+complete Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next
+group on a dedicated CUDA stream, and use a realistic static KV cache:
 
 ```bash
 .venv/bin/python scripts/run_qwen3_awq.py \
-  --layers-per-gpu-group 2 \
-  --prefetch-groups 1 \
-  --max-new-tokens 32
+  --layers-per-gpu-group 24 \
+  --prefetch-groups 2 \
+  --cpu-layer-cache-gib 4 \
+  --cache-implementation static \
+  --max-new-tokens 64
 ```
 
 Prompt batching is supported by repeating `--prompt`, loading one prompt per line from `--prompt-file`, and setting `--batch-size`:
@@ -112,11 +116,16 @@ Prompt batching is supported by repeating `--prompt`, loading one prompt per lin
   --prompt "Explain CUDA streams" \
   --prompt "Explain KV caching" \
   --batch-size 2 \
-  --layers-per-gpu-group 2 \
-  --prefetch-groups 1
+  --layers-per-gpu-group 24 \
+  --prefetch-groups 2 \
+  --cpu-layer-cache-gib 4 \
+  --cache-implementation static
 ```
 
-The runner reports batch size, generated tokens, total and per-prompt tokens/sec, elapsed time, peak VRAM, and live group/layer/prefetch state. Use `--no-live-stats` for quiet output.
+The runner reports batch size, generated tokens, total and per-prompt tokens/sec,
+elapsed time, peak VRAM, CPU/cache waits, CUDA-copy waits, cache hits, and live
+group/layer/prefetch state. Use `--no-live-stats` for quiet output or
+`--no-cuda-copy-stream` for an A/B control.
 
 For repeatable comparisons across group sizes, prefetch depths, and prompt batch sizes, see [benchmarks/README.md](benchmarks/README.md).
 
@@ -208,7 +217,11 @@ When initialize the model, we support the following configurations:
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
-* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
+* **prefetching**: overlap upcoming layer-shard loading with current-group compute. Enabled by default.
+* **layers_per_gpu_group**: consecutive decoder layers to keep resident on the GPU before releasing the group.
+* **prefetch_groups**: upcoming groups to stage in CPU memory.
+* **cuda_copy_stream**: stage the immediate next group on a dedicated CUDA stream while the current group computes.
+* **cpu_layer_cache_gib**: bounded CPU-RAM budget for retaining layer shards across autoregressive forwards. Use `0` to disable retention.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS

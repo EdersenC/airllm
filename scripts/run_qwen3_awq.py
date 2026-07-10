@@ -29,6 +29,16 @@ def parse_args():
                         help="Consecutive decoder layers to keep on GPU at once")
     parser.add_argument("--prefetch-groups", type=int, default=1,
                         help="Upcoming GPU groups to cache in CPU memory")
+    parser.add_argument("--cpu-layer-cache-gib", type=float, default=4.0,
+                        help="Bounded pinned-RAM cache for layer shards")
+    parser.add_argument("--no-cuda-copy-stream", action="store_true",
+                        help="Disable background CPU-to-GPU copies")
+    parser.add_argument(
+        "--cache-implementation",
+        choices=("dynamic", "static", "offloaded", "offloaded_static"),
+        default="static",
+        help="Transformers KV-cache implementation",
+    )
     parser.add_argument("--no-live-stats", action="store_true",
                         help="Disable live layer/group progress output")
     parser.add_argument("--live-stats-interval", type=float, default=0.25,
@@ -77,6 +87,10 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         max_new_tokens=args.max_new_tokens,
         do_sample=False,
         use_cache=True,
+        cache_implementation=args.cache_implementation,
+        # AirLLM swaps meta/GPU weights from Python hooks every forward, which
+        # cannot be captured safely by Transformers' static-cache auto-compile.
+        disable_compile=True,
         return_dict_in_generate=True,
     )
     if torch.cuda.is_available():
@@ -99,7 +113,11 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         f"groups_loaded={runtime_stats['groups_loaded']} "
         f"cpu_wait_seconds={runtime_stats['group_cpu_wait_seconds']:.2f} "
         f"gpu_load_seconds={runtime_stats['group_gpu_load_seconds']:.2f} "
+        f"copy_wait_seconds={runtime_stats['group_copy_wait_seconds']:.2f} "
         f"group_compute_seconds={runtime_stats['group_compute_seconds']:.2f}"
+        f" cuda_prefetched_groups={runtime_stats['cuda_prefetched_groups']} "
+        f"cpu_cache_hits={runtime_stats['cpu_cache_hits']} "
+        f"cpu_cache_gib={runtime_stats['cpu_cache_bytes'] / (1024 ** 3):.2f}"
         + (f" peak_vram_mb={peak_vram_mb:.0f}" if peak_vram_mb is not None else "")
     )
     for index, text in enumerate(decoded):
@@ -130,6 +148,9 @@ def main():
     print(f"device: {device}")
     print(f"layers_per_gpu_group: {args.layers_per_gpu_group}")
     print(f"prefetch_groups: {args.prefetch_groups}")
+    print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
+    print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
+    print(f"kv_cache: {args.cache_implementation}")
     print(f"prompt_count: {len(prompts)} batch_size: {batch_size}")
 
     model = AutoModel.from_pretrained(
@@ -137,6 +158,8 @@ def main():
         device=device,
         layers_per_gpu_group=args.layers_per_gpu_group,
         prefetch_groups=args.prefetch_groups,
+        cuda_copy_stream=not args.no_cuda_copy_stream,
+        cpu_layer_cache_gib=args.cpu_layer_cache_gib,
         show_live_stats=not args.no_live_stats,
         live_stats_interval=args.live_stats_interval,
         layer_shards_saving_path=str(args.layer_shards_path) if args.layer_shards_path else None,

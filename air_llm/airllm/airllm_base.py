@@ -12,6 +12,7 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
+from .cpu_layer_cache import CPULayerCache
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, \
@@ -102,7 +103,8 @@ class AirLLMBaseModel:
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
-                 live_stats_interval=0.25):
+                 live_stats_interval=0.25, cuda_copy_stream=True,
+                 cpu_layer_cache_gib=0.0):
         """
         Parameters
         ----------
@@ -137,6 +139,13 @@ class AirLLMBaseModel:
             print throttled group/layer/prefetch progress to stderr during generation.
         live_stats_interval: float, optional
             minimum seconds between non-critical live-stat updates.
+        cuda_copy_stream: bool, optional
+            stage the immediate next group on a dedicated CUDA stream while the
+            current group computes. Disabled automatically on CPU or without prefetching.
+        cpu_layer_cache_gib: float, optional
+            bounded CPU RAM budget for retaining layer shards across forward passes.
+            Cached tensors are pinned when prefetching is enabled so the CUDA copy
+            stream can reuse them without another disk read or staging copy.
         """
 
         if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
@@ -147,6 +156,9 @@ class AirLLMBaseModel:
             raise ValueError("prefetch_groups must be a positive integer")
         if live_stats_interval < 0:
             raise ValueError("live_stats_interval must be non-negative")
+        if isinstance(cpu_layer_cache_gib, bool) or not isinstance(
+                cpu_layer_cache_gib, (int, float)) or cpu_layer_cache_gib < 0:
+            raise ValueError("cpu_layer_cache_gib must be a non-negative number")
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
@@ -213,6 +225,18 @@ class AirLLMBaseModel:
             self.prefetching = False
         self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
         self._prefetch_futures = {}
+        self.cuda_copy_stream = bool(
+            cuda_copy_stream and self.prefetching and self.device.type == "cuda")
+        self._copy_stream = torch.cuda.Stream(device=self.device) if self.cuda_copy_stream else None
+        self._gpu_prefetch_executor = (
+            ThreadPoolExecutor(max_workers=1) if self.cuda_copy_stream else None)
+        self._gpu_prefetch_futures = {}
+        self._group_cpu_sources = {}
+        self._group_copy_events = {}
+        self.cpu_layer_cache = CPULayerCache(
+            max_gib=float(cpu_layer_cache_gib),
+            pin_memory=self.prefetching and self.device.type == "cuda",
+        )
         self._resident_group_id = None
         self._forward_count = 0
         self._live_batch_size = "?"
@@ -335,23 +359,20 @@ class AirLLMBaseModel:
     # ---- weight streaming -------------------------------------------------------------------
 
     def load_layer_to_cpu(self, layer_name):
-        t = time.time()
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
-        elapsed_time = time.time() - t
+        def read_layer():
+            started = time.time()
+            output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
+            elapsed_time = time.time() - started
 
-        if self.profiling_mode:
-            state_dict, compression_time = load_layer_output
-            disk_loading_time = elapsed_time - compression_time
-            self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
-            self.profiler.add_profiling_time('compression_time', compression_time)
-        else:
-            state_dict = load_layer_output
+            if self.profiling_mode:
+                state_dict, compression_time = output
+                disk_loading_time = elapsed_time - compression_time
+                self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
+                self.profiler.add_profiling_time('compression_time', compression_time)
+                return state_dict
+            return output
 
-        if self.prefetching and torch.cuda.is_available():
-            for k in state_dict.keys():
-                state_dict[k] = state_dict[k].pin_memory()
-
-        return state_dict
+        return self.cpu_layer_cache.get_or_load(layer_name, read_layer)
 
     def move_layer_to_device(self, state_dict):
         moved = []
@@ -486,13 +507,117 @@ class AirLLMBaseModel:
             return state_dicts
         return self._load_group_to_cpu(group_id)
 
+    def _group_supports_cuda_prefetch(self, state_dicts):
+        if self.hf_quantizer is None:
+            return True
+        return not any(
+            self._needs_quantization(param_name)
+            for state_dict in state_dicts
+            for param_name in self._param_names_from_state_dict(state_dict)
+        )
+
+    def _materialize_group(self, group_id, state_dicts):
+        expected_layers = self._streaming_groups[group_id]
+        if len(state_dicts) != len(expected_layers):
+            raise RuntimeError(
+                f"prefetched group {group_id} contained {len(state_dicts)} layers; "
+                f"expected {len(expected_layers)}"
+            )
+
+        loaded_modules = []
+        try:
+            for idx, state_dict in zip(expected_layers, state_dicts):
+                module = self.layers[idx]
+                module._airllm_moved = self.move_layer_to_device(state_dict)
+                loaded_modules.append(module)
+        except Exception:
+            for module in loaded_modules:
+                if self.hf_quantizer is not None:
+                    for param_name in getattr(module, '_airllm_moved', []):
+                        set_module_tensor_to_device(self.model, param_name, 'meta')
+                else:
+                    module.to('meta')
+                module._airllm_moved = []
+            raise
+        return loaded_modules
+
+    def _prepare_group_on_cuda_stream(self, group_id, cpu_future):
+        state_dicts = cpu_future.result()
+        if not self._group_supports_cuda_prefetch(state_dicts):
+            return {"async": False, "state_dicts": state_dicts}
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.device(self.device), torch.cuda.stream(self._copy_stream):
+            start_event.record(self._copy_stream)
+            self._materialize_group(group_id, state_dicts)
+            end_event.record(self._copy_stream)
+        return {
+            "async": True,
+            "state_dicts": state_dicts,
+            "start_event": start_event,
+            "end_event": end_event,
+        }
+
+    def _schedule_cuda_group_prefetch(self, group_id):
+        if not self.cuda_copy_stream:
+            return
+        next_group_id = group_id + 1
+        if next_group_id >= len(self._streaming_groups) \
+                or next_group_id in self._gpu_prefetch_futures:
+            return
+        cpu_future = self._prefetch_futures.pop(next_group_id, None)
+        if cpu_future is None:
+            return
+        self._gpu_prefetch_futures[next_group_id] = self._gpu_prefetch_executor.submit(
+            self._prepare_group_on_cuda_stream, next_group_id, cpu_future)
+
+    def _record_group_on_stream(self, group_id, stream):
+        for idx in self._streaming_groups[group_id]:
+            module = self.layers[idx]
+            for tensor in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
+                if tensor is not None and tensor.device.type == "cuda":
+                    tensor.record_stream(stream)
+
+    def _activate_cuda_prefetched_group(self, group_id):
+        future = self._gpu_prefetch_futures.pop(group_id, None)
+        if future is None:
+            return False, None
+
+        wait_started = time.perf_counter()
+        prepared = future.result()
+        self._runtime_stats["group_cpu_wait_seconds"] += time.perf_counter() - wait_started
+        if not prepared["async"]:
+            return False, prepared["state_dicts"]
+
+        end_event = prepared["end_event"]
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_event(end_event)
+        copy_wait_started = time.perf_counter()
+        end_event.synchronize()
+        self._runtime_stats["group_copy_wait_seconds"] += time.perf_counter() - copy_wait_started
+        self._runtime_stats["group_gpu_load_seconds"] += (
+            prepared["start_event"].elapsed_time(end_event) / 1000.0)
+        self._record_group_on_stream(group_id, current_stream)
+        self._group_cpu_sources[group_id] = prepared["state_dicts"]
+        self._group_copy_events[group_id] = end_event
+        self._runtime_stats["groups_loaded"] += 1
+        self._runtime_stats["cuda_prefetched_groups"] += 1
+        self._resident_group_id = group_id
+        return True, None
+
     def _prefetch_status(self):
-        if not self._prefetch_futures:
+        if not self._prefetch_futures and not self._gpu_prefetch_futures:
             return "none"
-        return ",".join(
+        cpu_status = [
             f"{group_id + 1}:{'ready' if future.done() else 'loading'}"
             for group_id, future in sorted(self._prefetch_futures.items())
-        )
+        ]
+        gpu_status = [
+            f"{group_id + 1}:{'gpu-ready' if future.done() else 'copying'}"
+            for group_id, future in sorted(self._gpu_prefetch_futures.items())
+        ]
+        return ",".join(cpu_status + gpu_status)
 
     def _emit_live_stats(self, group_id, idx, phase, args=None, force=False):
         group_layers = self._streaming_groups[group_id]
@@ -512,6 +637,13 @@ class AirLLMBaseModel:
         )
 
     def _unload_group(self, group_id):
+        self._release_group_modules(group_id)
+        self._group_cpu_sources.pop(group_id, None)
+        self._group_copy_events.pop(group_id, None)
+        if self._resident_group_id == group_id:
+            self._resident_group_id = None
+
+    def _release_group_modules(self, group_id):
         for idx in self._streaming_groups[group_id]:
             module = self.layers[idx]
             if self.hf_quantizer is not None:
@@ -520,37 +652,25 @@ class AirLLMBaseModel:
             else:
                 module.to('meta')
             module._airllm_moved = []
-        self._resident_group_id = None
 
     def _load_group_to_device(self, group_id):
         first_idx = self._streaming_groups[group_id][0]
         self._emit_live_stats(group_id, first_idx, "loading", force=True)
-        cpu_wait_started = time.perf_counter()
-        state_dicts = self._take_group_from_prefetch(group_id)
-        self._runtime_stats["group_cpu_wait_seconds"] += time.perf_counter() - cpu_wait_started
-        expected_layers = self._streaming_groups[group_id]
-        if len(state_dicts) != len(expected_layers):
-            raise RuntimeError(
-                f"prefetched group {group_id} contained {len(state_dicts)} layers; "
-                f"expected {len(expected_layers)}"
-            )
-        loaded_modules = []
+        activated, state_dicts = self._activate_cuda_prefetched_group(group_id)
+        if activated:
+            self._schedule_group_prefetch(group_id)
+            self._schedule_cuda_group_prefetch(group_id)
+            self._emit_live_stats(group_id, first_idx, "ready", force=True)
+            return
+
+        if state_dicts is None:
+            cpu_wait_started = time.perf_counter()
+            state_dicts = self._take_group_from_prefetch(group_id)
+            self._runtime_stats["group_cpu_wait_seconds"] += time.perf_counter() - cpu_wait_started
         gpu_load_started = time.perf_counter()
         try:
-            for idx, state_dict in zip(expected_layers, state_dicts):
-                module = self.layers[idx]
-                module._airllm_moved = self.move_layer_to_device(state_dict)
-                loaded_modules.append(module)
+            self._materialize_group(group_id, state_dicts)
         except Exception:
-            # Do not leave a partially loaded group on the GPU if a quantized
-            # parameter fails during materialization.
-            for module in loaded_modules:
-                if self.hf_quantizer is not None:
-                    for param_name in getattr(module, '_airllm_moved', []):
-                        set_module_tensor_to_device(self.model, param_name, 'meta')
-                else:
-                    module.to('meta')
-                module._airllm_moved = []
             clean_memory()
             raise
 
@@ -558,6 +678,7 @@ class AirLLMBaseModel:
         self._runtime_stats["groups_loaded"] += 1
         self._resident_group_id = group_id
         self._schedule_group_prefetch(group_id)
+        self._schedule_cuda_group_prefetch(group_id)
         self._emit_live_stats(group_id, first_idx, "ready", force=True)
 
     def _pre_hook(self, module, args):
@@ -600,14 +721,34 @@ class AirLLMBaseModel:
             "groups_loaded": 0,
             "group_cpu_wait_seconds": 0.0,
             "group_gpu_load_seconds": 0.0,
+            "group_copy_wait_seconds": 0.0,
             "group_compute_seconds": 0.0,
+            "cuda_prefetched_groups": 0,
         }
         self._group_compute_started = {}
 
     def _cancel_prefetch_futures(self):
-        for future in self._prefetch_futures.values():
-            future.cancel()
+        cpu_futures = tuple(self._prefetch_futures.values())
         self._prefetch_futures.clear()
+        for future in cpu_futures:
+            if future.cancel():
+                continue
+            try:
+                future.result()
+            except BaseException:
+                pass
+        gpu_futures = tuple(self._gpu_prefetch_futures.items())
+        self._gpu_prefetch_futures.clear()
+        for group_id, future in gpu_futures:
+            if future.cancel():
+                continue
+            try:
+                prepared = future.result()
+            except BaseException:
+                continue
+            if prepared.get("async"):
+                prepared["end_event"].synchronize()
+                self._release_group_modules(group_id)
 
     def close(self):
         """Release resident weights and stop the CPU prefetch worker."""
@@ -624,6 +765,10 @@ class AirLLMBaseModel:
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
+        if self._gpu_prefetch_executor is not None:
+            self._gpu_prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._gpu_prefetch_executor = None
+        self.cpu_layer_cache.close()
         clean_memory()
 
     def __enter__(self):
@@ -635,11 +780,19 @@ class AirLLMBaseModel:
 
     def get_runtime_stats(self):
         """Return timing counters for the most recent generation call."""
+        cache_stats = self.cpu_layer_cache.stats()
         return {
             **self._runtime_stats,
             "forward_passes": self._forward_count,
             "layers_per_gpu_group": self.layers_per_gpu_group,
             "prefetch_groups": self.prefetch_groups,
+            "cuda_copy_stream": self.cuda_copy_stream,
+            "cpu_cache_hits": cache_stats.hits,
+            "cpu_cache_misses": cache_stats.misses,
+            "cpu_cache_evictions": cache_stats.evictions,
+            "cpu_cache_bytes": cache_stats.bytes,
+            "cpu_cache_max_bytes": cache_stats.max_bytes,
+            "cpu_cache_entries": cache_stats.entries,
         }
 
     def generate(self, *args, **kwargs):

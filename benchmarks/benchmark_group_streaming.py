@@ -12,7 +12,9 @@ import argparse
 import csv
 import json
 import statistics
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,11 +35,23 @@ CSV_FIELDS = (
     "time_to_first_token_s",
     "total_latency_s",
     "peak_vram_mb",
+    "gpu_util_avg_pct",
+    "gpu_util_p95_pct",
+    "gpu_util_max_pct",
+    "gpu_power_avg_w",
+    "gpu_power_max_w",
+    "gpu_temp_max_c",
     "forward_passes",
     "groups_loaded",
     "group_cpu_wait_seconds",
     "group_gpu_load_seconds",
+    "group_copy_wait_seconds",
     "group_compute_seconds",
+    "cuda_prefetched_groups",
+    "cpu_cache_hits",
+    "cpu_cache_misses",
+    "cpu_cache_evictions",
+    "cpu_cache_gib",
     "configuration",
 )
 
@@ -100,6 +114,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-prefetch",
         action="store_true",
         help="Disable asynchronous group prefetching while retaining the configured count.",
+    )
+    parser.add_argument(
+        "--no-cuda-copy-stream",
+        action="store_true",
+        help="Disable staging the next group on a dedicated CUDA copy stream.",
+    )
+    parser.add_argument(
+        "--cpu-layer-cache-gib",
+        type=float,
+        default=4.0,
+        help="Bounded pinned CPU-RAM cache for layer shards; zero disables retention.",
+    )
+    parser.add_argument(
+        "--cache-implementation",
+        choices=("dynamic", "static", "offloaded", "offloaded_static"),
+        default="static",
+        help="Transformers KV-cache implementation used during generation.",
     )
 
     prompt_source = parser.add_mutually_exclusive_group()
@@ -198,6 +229,71 @@ class FirstTokenTimer:
 
     def end(self) -> None:
         return
+
+
+class GPUStatsMonitor:
+    """Low-frequency nvidia-smi sampler for utilization, power, and temperature."""
+
+    def __init__(self, device_index: int, interval: float = 0.25) -> None:
+        self.device_index = device_index
+        self.interval = interval
+        self.samples: list[tuple[float, float, float]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict[str, float | None]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval * 4))
+        if not self.samples:
+            return {
+                "gpu_util_avg_pct": None,
+                "gpu_util_p95_pct": None,
+                "gpu_util_max_pct": None,
+                "gpu_power_avg_w": None,
+                "gpu_power_max_w": None,
+                "gpu_temp_max_c": None,
+            }
+        utilization = [sample[0] for sample in self.samples]
+        power = [sample[1] for sample in self.samples]
+        temperatures = [sample[2] for sample in self.samples]
+        ordered_utilization = sorted(utilization)
+        p95_index = min(len(ordered_utilization) - 1, int(0.95 * len(ordered_utilization)))
+        return {
+            "gpu_util_avg_pct": statistics.fmean(utilization),
+            "gpu_util_p95_pct": ordered_utilization[p95_index],
+            "gpu_util_max_pct": max(utilization),
+            "gpu_power_avg_w": statistics.fmean(power),
+            "gpu_power_max_w": max(power),
+            "gpu_temp_max_c": max(temperatures),
+        }
+
+    def _run(self) -> None:
+        command = (
+            "nvidia-smi",
+            f"--id={self.device_index}",
+            "--query-gpu=utilization.gpu,power.draw,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        )
+        while not self._stop.is_set():
+            try:
+                result = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                values = [float(value.strip()) for value in result.stdout.strip().split(",")]
+                if len(values) == 3:
+                    self.samples.append((values[0], values[1], values[2]))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            self._stop.wait(self.interval)
 
 
 def read_prompts(args: argparse.Namespace) -> tuple[list[str], str]:
@@ -315,6 +411,7 @@ def generate_once(
     encoded: dict[str, Any],
     device: Any,
     max_new_tokens: int,
+    cache_implementation: str,
 ) -> dict[str, float | int | None]:
     model_inputs = move_inputs(encoded, device)
     input_ids = model_inputs["input_ids"]
@@ -326,10 +423,15 @@ def generate_once(
         torch.cuda.reset_peak_memory_stats(device)
 
     streamer = FirstTokenTimer()
+    gpu_monitor = GPUStatsMonitor(device.index or 0) if device.type == "cuda" else None
     generation_kwargs: dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
         "do_sample": False,
         "use_cache": True,
+        "cache_implementation": cache_implementation,
+        # Group hooks materialize different parameters every forward. Keep the
+        # realistic static cache, but do not let Transformers torch.compile it.
+        "disable_compile": True,
         "return_dict_in_generate": True,
         "streamer": streamer,
     }
@@ -337,10 +439,15 @@ def generate_once(
         generation_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     started = time.perf_counter()
-    with torch.inference_mode():
-        output = model.generate(**model_inputs, **generation_kwargs)
-    synchronize(torch, device)
-    finished = time.perf_counter()
+    if gpu_monitor is not None:
+        gpu_monitor.start()
+    try:
+        with torch.inference_mode():
+            output = model.generate(**model_inputs, **generation_kwargs)
+        synchronize(torch, device)
+        finished = time.perf_counter()
+    finally:
+        gpu_metrics = gpu_monitor.stop() if gpu_monitor is not None else {}
 
     sequences = getattr(output, "sequences", output)
     generated_tokens = count_generated_tokens(sequences, input_width, tokenizer)
@@ -359,11 +466,21 @@ def generate_once(
         "time_to_first_token_s": ttft,
         "total_latency_s": total_latency,
         "peak_vram_mb": peak_vram,
+        **gpu_metrics,
         "forward_passes": runtime_stats.get("forward_passes"),
         "groups_loaded": runtime_stats.get("groups_loaded"),
         "group_cpu_wait_seconds": runtime_stats.get("group_cpu_wait_seconds"),
         "group_gpu_load_seconds": runtime_stats.get("group_gpu_load_seconds"),
+        "group_copy_wait_seconds": runtime_stats.get("group_copy_wait_seconds"),
         "group_compute_seconds": runtime_stats.get("group_compute_seconds"),
+        "cuda_prefetched_groups": runtime_stats.get("cuda_prefetched_groups"),
+        "cpu_cache_hits": runtime_stats.get("cpu_cache_hits"),
+        "cpu_cache_misses": runtime_stats.get("cpu_cache_misses"),
+        "cpu_cache_evictions": runtime_stats.get("cpu_cache_evictions"),
+        "cpu_cache_gib": (
+            runtime_stats.get("cpu_cache_bytes", 0) / (1024 ** 3)
+            if runtime_stats else None
+        ),
     }
 
 
@@ -408,6 +525,8 @@ def write_json(path: Path, rows: list[dict[str, Any]], configuration: dict[str, 
             "time_to_first_token_s": summarize_metric(rows, "time_to_first_token_s"),
             "total_latency_s": summarize_metric(rows, "total_latency_s"),
             "peak_vram_mb": summarize_metric(rows, "peak_vram_mb"),
+            "gpu_util_avg_pct": summarize_metric(rows, "gpu_util_avg_pct"),
+            "gpu_power_avg_w": summarize_metric(rows, "gpu_power_avg_w"),
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -420,6 +539,9 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "group_size": args.group_size,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
+        "cuda_copy_stream": not args.no_cuda_copy_stream,
+        "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "cache_implementation": args.cache_implementation,
         "prompt_source": source,
         "prompt_batch_size": args.prompt_batch_size,
         "prompt_batch_count": len(batches),
@@ -458,6 +580,9 @@ def main() -> int:
     print(f"group_size: {args.group_size}")
     print(f"prefetch_groups: {args.prefetch_groups}")
     print(f"prefetching: {not args.no_prefetch}")
+    print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
+    print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
+    print(f"kv_cache: {args.cache_implementation}")
     print(f"prompt_batches: {len(batches)} x {args.prompt_batch_size}")
 
     model_kwargs: dict[str, Any] = {
@@ -465,6 +590,8 @@ def main() -> int:
         "layers_per_gpu_group": args.group_size,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
+        "cuda_copy_stream": not args.no_cuda_copy_stream,
+        "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
     }
     if args.layer_shards_path is not None:
         model_kwargs["layer_shards_saving_path"] = str(args.layer_shards_path.expanduser())
@@ -480,6 +607,7 @@ def main() -> int:
             encoded_batches[0],
             device,
             args.max_new_tokens,
+            args.cache_implementation,
         )
 
     configuration: dict[str, Any] = {
@@ -488,6 +616,9 @@ def main() -> int:
         "group_size": args.group_size,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
+        "cuda_copy_stream": not args.no_cuda_copy_stream,
+        "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "cache_implementation": args.cache_implementation,
         "prompt_source": prompt_source,
         "prompt_repeats": args.prompt_repeats,
         "prompt_batch_size": args.prompt_batch_size,
@@ -505,9 +636,15 @@ def main() -> int:
             "time_to_first_token_s": "time until the first generation streamer callback after the prompt callback",
             "total_latency_s": "generation wall time, excluding model load and tokenization",
             "peak_vram_mb": "torch.cuda.max_memory_allocated for the selected device; null on CPU",
+            "gpu_util_avg_pct": "mean nvidia-smi GPU utilization sampled every 250 ms",
+            "gpu_util_p95_pct": "95th percentile sampled GPU utilization",
+            "gpu_power_avg_w": "mean sampled board power draw",
+            "gpu_temp_max_c": "maximum sampled GPU temperature",
             "group_cpu_wait_seconds": "time spent waiting for each requested group to arrive from the CPU prefetch path",
             "group_gpu_load_seconds": "time spent materializing requested group weights on the GPU",
+            "group_copy_wait_seconds": "handoff time blocked waiting for the CUDA copy stream",
             "group_compute_seconds": "time spent executing grouped layer modules",
+            "cpu_cache_gib": "current bounded CPU layer-cache payload in GiB",
         },
     }
 
@@ -521,6 +658,7 @@ def main() -> int:
                 encoded,
                 device,
                 args.max_new_tokens,
+                args.cache_implementation,
             )
             row = {
                 "repeat_index": repeat_index,
@@ -531,13 +669,19 @@ def main() -> int:
             rows.append(row)
             ttft = "n/a" if row["time_to_first_token_s"] is None else f"{row['time_to_first_token_s']:.3f}s"
             peak = "n/a" if row["peak_vram_mb"] is None else f"{row['peak_vram_mb']:.1f}MB"
+            utilization = (
+                "n/a" if row["gpu_util_avg_pct"] is None
+                else f"{row['gpu_util_avg_pct']:.1f}% avg/{row['gpu_util_p95_pct']:.0f}% p95"
+            )
             throughput = "n/a" if row["tokens_per_sec"] is None else f"{row['tokens_per_sec']:.2f}"
             print(
                 f"run {repeat_index}/{args.repeats} batch {batch_index}/{len(encoded_batches)}: "
                 f"{throughput} tok/s, ttft {ttft}, "
                 f"latency {row['total_latency_s']:.3f}s, peak_vram {peak}, "
+                f"gpu_util {utilization}, "
                 f"cpu_wait {row['group_cpu_wait_seconds']:.3f}s, "
                 f"gpu_load {row['group_gpu_load_seconds']:.3f}s, "
+                f"copy_wait {row['group_copy_wait_seconds']:.3f}s, "
                 f"compute {row['group_compute_seconds']:.3f}s"
             )
 
