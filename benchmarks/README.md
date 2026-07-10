@@ -140,17 +140,21 @@ tokens per run (`min_new_tokens == max_new_tokens`).
 
 | Active decoder layers | Mean throughput | Speedup vs. 36 | Peak allocation | Prompt sanity |
 | ---: | ---: | ---: | ---: | --- |
-| 36 / 36 | 10.60 tok/s | 1.00x | 2,611 MiB | Baseline remained recognizable |
+| 36 / 36 | 10.60 tok/s | 1.00x | 2,611 MiB | Passed (`Paris`, `4`, `blue`) |
+| 31 / 36, Block Influence | **13.61 tok/s** | **1.28x** | **2,355 MiB** | Passed (`Paris`, `4`, `blue`) |
 | 18 / 36 | 22.51 tok/s | 2.12x | 1,691 MiB | Failed simple factual prompts |
 | 12 / 36 | **28.19 tok/s** | **2.66x** | **1,385 MiB** | Failed simple factual prompts |
 
-The 12-layer configuration is the raw-TPS winner, but neither reduced stack is a
-usable replacement for the original checkpoint without distillation or further
-layer-selection/quality work. The 36-layer configuration remains the fastest one
-that passed the basic output sanity check. The measured source indices were:
+The 12-layer configuration remains the raw-TPS winner, but neither aggressive
+stack is a usable replacement for the original checkpoint without distillation.
+The 31-layer profile is the fastest configuration that passed the basic output
+sanity check. At 30 layers the answers were still factually recognizable but
+became verbose and repetitive, so the prepared profile conservatively requires
+31. The measured source indices were:
 
-- 18 layers: `0,2,4,6,8,10,12,14,16,19,21,23,25,27,29,31,33,35`
-- 12 layers: `0,3,6,10,13,16,19,22,25,29,32,35`
+- safe 31-layer profile: `0-28,34,35`
+- historical even 18-layer speed run: `0,2,4,6,8,10,12,14,16,19,21,23,25,27,29,31,33,35`
+- historical even 12-layer speed run: `0,3,6,10,13,16,19,22,25,29,32,35`
 
 On the tested 12 GB RTX 5070, the current branch measured the following local
 results. Generated result files remain gitignored by repository policy; rerun
