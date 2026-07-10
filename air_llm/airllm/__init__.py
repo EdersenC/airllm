@@ -14,6 +14,7 @@ else:
     from .airllm_base import AirLLMBaseModel
     from .auto_model import AutoModel
     from .utils import split_and_save_layers
+    from .utils import compress_layer_state_dict, uncompress_layer_state_dict
     from .utils import NotEnoughSpaceException
 
     # Dedicated subclasses for a handful of custom-architecture models. Some of them pull in
@@ -40,4 +41,3 @@ else:
                 f"airllm: optional model class {_name} is unavailable ({_e}). "
                 f"This only affects that specific model family; the generic streaming path still works."
             )
-
