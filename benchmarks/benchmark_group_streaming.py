@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.metadata
 import json
+import platform
 import statistics
 import subprocess
 import sys
@@ -48,6 +50,9 @@ CSV_FIELDS = (
     "group_copy_wait_seconds",
     "group_compute_seconds",
     "cuda_prefetched_groups",
+    "resident_group_hits",
+    "resident_groups",
+    "quantized_kernel",
     "cpu_cache_hits",
     "cpu_cache_misses",
     "cpu_cache_evictions",
@@ -125,6 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=4.0,
         help="Bounded pinned CPU-RAM cache for layer shards; zero disables retention.",
+    )
+    parser.add_argument(
+        "--persistent-gpu-residency",
+        action="store_true",
+        help="Preload and retain the complete model when it fits in VRAM.",
+    )
+    parser.add_argument(
+        "--awq-backend",
+        choices=("auto", "marlin", "gemm_triton", "torch_awq", "torch_fused_awq"),
+        default=None,
+        help="Explicit GPTQModel AWQ kernel; Marlin requires persistent residency.",
     )
     parser.add_argument(
         "--cache-implementation",
@@ -347,6 +363,71 @@ def resolve_device(torch: Any, requested: str) -> Any:
     return device
 
 
+def _metadata_command(command: tuple[str, ...]) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def collect_environment_metadata(torch: Any, device: Any, model_path: Any) -> dict[str, Any]:
+    """Collect enough runtime identity to make benchmark JSON independently useful."""
+    try:
+        import transformers
+        transformers_version = transformers.__version__
+    except (ImportError, AttributeError):
+        transformers_version = None
+    try:
+        gptqmodel_version = importlib.metadata.version("gptqmodel")
+    except importlib.metadata.PackageNotFoundError:
+        gptqmodel_version = None
+
+    resolved_model_path = Path(model_path).expanduser().resolve()
+    snapshot_revision = (
+        resolved_model_path.name
+        if resolved_model_path.parent.name == "snapshots" else None
+    )
+    git_status = _metadata_command(("git", "status", "--porcelain"))
+    metadata: dict[str, Any] = {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": str(torch.__version__),
+        "transformers_version": transformers_version,
+        "gptqmodel_version": gptqmodel_version,
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+        "git_revision": _metadata_command(("git", "rev-parse", "HEAD")),
+        "git_branch": _metadata_command(("git", "rev-parse", "--abbrev-ref", "HEAD")),
+        "git_dirty": git_status is not None,
+        "resolved_model_path": str(resolved_model_path),
+        "model_snapshot_revision": snapshot_revision,
+        "device": str(device),
+    }
+    torch_device = torch.device(device)
+    if torch_device.type == "cuda":
+        device_index = torch_device.index or 0
+        properties = torch.cuda.get_device_properties(device_index)
+        metadata.update({
+            "gpu_name": properties.name,
+            "gpu_total_memory_mib": properties.total_memory / (1024 ** 2),
+            "gpu_compute_capability": list(torch.cuda.get_device_capability(device_index)),
+            "nvidia_driver_version": _metadata_command((
+                "nvidia-smi",
+                f"--id={device_index}",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            )),
+        })
+    return metadata
+
+
 def tokenize_batches(tokenizer: Any, batches: list[list[str]], max_input_tokens: int) -> list[dict[str, Any]]:
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is None:
@@ -398,7 +479,7 @@ def count_generated_tokens(sequences: Any, input_width: int, tokenizer: Any) -> 
         if stop_ids:
             for index, token_id in enumerate(generated):
                 if token_id in stop_ids:
-                    count = index + 1
+                    count = index
                     break
         total += count
     return total
@@ -474,6 +555,9 @@ def generate_once(
         "group_copy_wait_seconds": runtime_stats.get("group_copy_wait_seconds"),
         "group_compute_seconds": runtime_stats.get("group_compute_seconds"),
         "cuda_prefetched_groups": runtime_stats.get("cuda_prefetched_groups"),
+        "resident_group_hits": runtime_stats.get("resident_group_hits"),
+        "resident_groups": runtime_stats.get("resident_groups"),
+        "quantized_kernel": runtime_stats.get("quantized_kernel"),
         "cpu_cache_hits": runtime_stats.get("cpu_cache_hits"),
         "cpu_cache_misses": runtime_stats.get("cpu_cache_misses"),
         "cpu_cache_evictions": runtime_stats.get("cpu_cache_evictions"),
@@ -541,6 +625,8 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "persistent_gpu_residency": args.persistent_gpu_residency,
+        "awq_backend": args.awq_backend,
         "cache_implementation": args.cache_implementation,
         "prompt_source": source,
         "prompt_batch_size": args.prompt_batch_size,
@@ -582,6 +668,8 @@ def main() -> int:
     print(f"prefetching: {not args.no_prefetch}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
     print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
+    print(f"persistent_gpu_residency: {args.persistent_gpu_residency}")
+    print(f"awq_backend: {args.awq_backend or 'checkpoint default'}")
     print(f"kv_cache: {args.cache_implementation}")
     print(f"prompt_batches: {len(batches)} x {args.prompt_batch_size}")
 
@@ -592,6 +680,8 @@ def main() -> int:
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "persistent_gpu_residency": args.persistent_gpu_residency,
+        "awq_backend": args.awq_backend,
     }
     if args.layer_shards_path is not None:
         model_kwargs["layer_shards_saving_path"] = str(args.layer_shards_path.expanduser())
@@ -618,6 +708,8 @@ def main() -> int:
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "persistent_gpu_residency": args.persistent_gpu_residency,
+        "awq_backend": args.awq_backend,
         "cache_implementation": args.cache_implementation,
         "prompt_source": prompt_source,
         "prompt_repeats": args.prompt_repeats,
@@ -630,6 +722,11 @@ def main() -> int:
         "repeats": args.repeats,
         "layer_shards_path": (
             str(args.layer_shards_path.expanduser()) if args.layer_shards_path is not None else None
+        ),
+        "environment": collect_environment_metadata(
+            torch,
+            device,
+            getattr(model, "model_local_path", model_path),
         ),
         "metrics": {
             "tokens_per_sec": "all non-EOS generated tokens across the batch divided by total latency",

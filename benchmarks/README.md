@@ -11,6 +11,8 @@ The harness supports:
   streaming configuration. Use `--no-prefetch` for a no-prefetch baseline.
 - `--cpu-layer-cache-gib` for the bounded pinned-RAM layer cache and
   `--no-cuda-copy-stream` for a synchronous-transfer control.
+- `--persistent-gpu-residency` to preload and retain every group when the full
+  model fits, plus `--awq-backend` for an explicit AWQ kernel such as Marlin.
 - `--cache-implementation` for realistic dynamic, static, or offloaded KV caches.
 - `--prompt-file` with one prompt per non-empty UTF-8 line, or repeat `--prompt`
   and use `--prompt-repeats` for repeated prompt batches.
@@ -49,6 +51,57 @@ the cache root to its current snapshot automatically:
   --output-json benchmarks/results/qwen3-awq-group2-prefetch2.json
 ```
 
+For the fastest tested full-resident path (after installing the CUDA 13.0
+toolchain listed in the top-level README), add persistent residency and Marlin:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --max-new-tokens 64 --no-live-stats
+
+.venv/bin/python benchmarks/benchmark_group_streaming.py \
+  --model-path /mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ \
+  --device cuda:0 \
+  --group-size 24 \
+  --prefetch-groups 8 \
+  --cpu-layer-cache-gib 16 \
+  --persistent-gpu-residency \
+  --awq-backend marlin \
+  --cache-implementation dynamic \
+  --max-new-tokens 64 \
+  --warmup 1 \
+  --repeats 3
+```
+
+On the tested 12 GB RTX 5070, the current branch measured the following local
+results. Generated result files remain gitignored by repository policy; rerun
+the commands above to regenerate them. New JSON/CSV configuration records include
+git revision/dirty state, model snapshot, GPU/driver, CUDA, Python, PyTorch,
+Transformers, and GPTQModel versions.
+
+| Workload | Throughput | Peak allocation |
+| --- | ---: | ---: |
+| Group-24 streaming, batch 1, 64-token dynamic run | 1.60 tok/s | 2,824 MiB |
+| Persistent Marlin, batch 1, warm 64-token runs | 11.12 tok/s | 2,599 MiB |
+| Persistent Marlin, batch 4, warm 64-token runs | 44.68 aggregate tok/s | 2,637 MiB |
+| 40,952-token prefill + 8-token decode | 40,960 total context | 11,415 MiB |
+
+The final max-context run averaged 92.0% GPU utilization and reached 21.25s TTFT.
+It leaves almost no VRAM margin, so keep batch size at 1 near the native 40,960
+token limit. At short context, batch 4 converts spare compute into throughput
+without materially increasing per-sequence latency.
+For the warm 64-token batch-1 comparison, dynamic KV reached 11.12 tok/s versus
+10.70 tok/s with static KV, so the prepared launcher intentionally defaults to dynamic.
+
+Reproduce the exact native-context test through the Marlin launcher:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --context-limit-benchmark
+```
+
+By default, `benchmark_context_limit.py` reads `max_position_embeddings`, creates
+a synthetic prompt of `native_context - 8` tokens, forces 8 decode tokens, and
+writes `benchmarks/results/context-limit.json`. Override `--input-tokens`,
+`--max-new-tokens`, or `--output-json` after the benchmark switch when needed.
+
 To use a prompt file instead, pass one prompt per non-empty line:
 
 ```bash
@@ -80,6 +133,8 @@ streamer callback and is `null` when the backend provides no measurable callback
 The runtime timing columns separate CPU-prefetch wait, GPU materialization,
 copy-stream handoff wait, and grouped-layer compute. GPU utilization, board
 power, and temperature are sampled through `nvidia-smi` every 250 ms.
+Persistent runs also report resident-group count and hit count. Their per-token
+CPU wait, GPU weight-load time, and copy wait should remain zero after preload.
 
 ## Guarded stress matrix
 

@@ -96,6 +96,52 @@ Then run the model from the Windows `S:` drive mounted in WSL:
 
 The script defaults to `/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ` and automatically resolves its Hugging Face cache snapshot. Pass `--prompt "your prompt"` to try another prompt.
 
+For the fastest tested RTX 5070 path, install the matching CUDA 13.0 JIT
+toolchain once:
+
+```bash
+uv pip install --python .venv/bin/python \
+  ninja \
+  nvidia-cuda-nvcc==13.0.88 \
+  nvidia-cuda-cccl==13.0.85 \
+  nvidia-cuda-crt==13.0.88 \
+  nvidia-nvvm==13.0.88 \
+  nvidia-cuda-runtime==13.0.88 \
+  nvidia-cublas==13.0.2.14
+```
+
+Then use the prepared launcher:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh
+```
+
+It enables persistent GPU residency, the Marlin AWQ kernel, 24-layer groups,
+8-group prefetch, a 16 GiB CPU-cache budget, dynamic KV, live stats, and 256
+new tokens with a 40,704-token prompt cap. The CPU shard cache is automatically released after all weights are
+resident. The first run compiles Marlin for the installed GPU and can take a few
+minutes; later runs reuse `~/.cache/airllm/gptqmodel-torch-extensions`. Add
+`--max-new-tokens 64`, `--no-live-stats`, or any normal runner option to override
+the launcher defaults.
+
+If the model or desired KV cache does not fit, the same launcher can fall back
+to normal grouped streaming (and a CPU-compatible AWQ kernel):
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --no-persistent-gpu-residency
+```
+
+To reproduce the exact native 40,960-token context stress test and write a JSON
+report under `benchmarks/results/`, run:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --context-limit-benchmark
+```
+
+Persistent residency is intentionally opt-in: use it only when the checkpoint
+plus the required KV cache fit in VRAM. Ordinary grouped streaming remains the
+safe path for larger checkpoints.
+
 For the tested 12 GB RTX 5070 setup, keep 24 decoder layers resident, retain the
 complete Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next
 group on a dedicated CUDA stream, and use a realistic dynamic KV cache:
@@ -222,6 +268,8 @@ When initialize the model, we support the following configurations:
 * **prefetch_groups**: upcoming groups to stage in CPU memory.
 * **cuda_copy_stream**: stage the immediate next group on a dedicated CUDA stream while the current group computes.
 * **cpu_layer_cache_gib**: bounded CPU-RAM budget for retaining layer shards across autoregressive forwards. Use `0` to disable retention.
+* **persistent_gpu_residency**: preload every group once and retain the complete model across decode steps. This removes per-token weight transfers but requires the checkpoint and KV cache to fit in VRAM.
+* **awq_backend**: select a GPTQModel AWQ kernel explicitly. `marlin` requires persistent GPU residency because its one-time repacked weights cannot be streamed back from raw AWQ shards.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS
