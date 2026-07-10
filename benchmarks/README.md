@@ -14,8 +14,10 @@ The harness supports:
 - `--persistent-gpu-residency` to preload and retain every group when the full
   model fits, plus `--awq-backend` for an explicit AWQ kernel such as Marlin.
 - `--cache-implementation` for realistic dynamic, static, or offloaded KV caches.
-- `--decoder-layer-count` for an explicitly quality-sacrificing, evenly sampled
-  reduced-depth run. The JSON records both the source indices and active count.
+- `--decoder-layer-count`, `--decoder-layer-profile`, and
+  `--decoder-layer-indices` for reduced-depth runs. A profile ranks blocks by
+  measured influence and can enforce a tested quality floor; the JSON records the
+  profile and exact source indices.
 - `--prompt-file` with one prompt per non-empty UTF-8 line, or repeat `--prompt`
   and use `--prompt-repeats` for repeated prompt batches.
 - `--prompt-batch-size`, `--max-new-tokens`, `--min-new-tokens`, `--warmup`, and
@@ -75,13 +77,30 @@ toolchain listed in the top-level README), add persistent residency and Marlin:
   --repeats 3
 ```
 
+For the fastest reduced stack that passed the local output sanity gate, use the
+prepared quality mode. It loads 31 of 36 blocks selected by Qwen's calibrated
+Block Influence ranking and applies the tokenizer's chat template:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --quality-reduced \
+  --max-new-tokens 128 \
+  --no-live-stats
+```
+
+The profile is tied to the exact local model snapshot. The launcher refuses a
+different snapshot or a count below 31 unless the run is explicitly marked
+unsafe.
+
 To compare the full 36-layer checkpoint against half depth and one-third depth,
-run the same benchmark three times and force an equal decode length:
+run the same benchmark three times and force an equal decode length. This is a
+speed-only experiment; `--allow-unsafe-layer-drop` is required because the half
+and third-depth stacks are known to generate broken text:
 
 ```bash
 for layers in 36 18 12; do
   ./scripts/run_qwen3_awq_marlin.sh --benchmark \
     --decoder-layer-count "${layers}" \
+    --allow-unsafe-layer-drop \
     --max-new-tokens 128 \
     --min-new-tokens 128 \
     --warmup 1 \
@@ -94,6 +113,24 @@ done
 The selected source-layer indices are printed at startup. Reduced depth is an
 inference experiment, not a distilled checkpoint: higher TPS does not imply that
 the resulting text preserves the original model's quality.
+
+The correction follows the Block Influence metric from
+[ShortGPT](https://aclanthology.org/2025.findings-acl.1035/): measure cosine
+distance between each block's input and output, then remove the least influential
+blocks first. ShortGPT's generative variant sends generated tokens through every
+layer to avoid accumulated decode errors, while NVIDIA's
+[Minitron report](https://arxiv.org/abs/2408.11796) uses distillation to recover
+quality after large structural reductions. Accordingly, this fork treats
+50–67% untrained depth removal as an unsafe benchmark, not a usable inference
+configuration.
+
+Regenerate the local influence scores through the prepared CUDA/Marlin
+environment:
+
+```bash
+./scripts/run_qwen3_awq_marlin.sh --calibrate-layer-profile \
+  --output-json benchmarks/results/qwen3-4b-awq-block-influence.json
+```
 
 ### Reduced-depth Qwen3-4B-AWQ result
 

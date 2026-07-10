@@ -9,10 +9,19 @@ from benchmarks.benchmark_group_streaming import (
     collect_environment_metadata,
     count_generated_tokens as benchmark_count_generated_tokens,
 )
-from scripts.run_qwen3_awq import count_generated_tokens as runner_count_generated_tokens
+from scripts.run_qwen3_awq import (
+    count_generated_tokens as runner_count_generated_tokens,
+    format_prompts,
+)
 
 
 class TestBenchmarkMetrics(unittest.TestCase):
+    class _ChatTokenizer:
+        chat_template = "present"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return f"<user>{messages[0]['content']}</user><assistant>"
+
     def test_eos_is_excluded_from_generated_token_throughput(self):
         sequences = torch.tensor([
             [8, 9, 10, 11, 2, 0],
@@ -54,6 +63,21 @@ class TestBenchmarkMetrics(unittest.TestCase):
         self.assertEqual(metadata["device"], "cpu")
         self.assertTrue(metadata["torch_version"])
         self.assertTrue(metadata["git_revision"])
+
+    def test_runner_auto_applies_chat_template_and_can_force_raw(self):
+        tokenizer = self._ChatTokenizer()
+
+        formatted, active_format = format_prompts(tokenizer, ["hello"], "auto", False)
+        raw, raw_format = format_prompts(tokenizer, ["hello"], "raw", False)
+
+        self.assertEqual(formatted, ["<user>hello</user><assistant>"])
+        self.assertEqual(active_format, "chat")
+        self.assertEqual(raw, ["hello"])
+        self.assertEqual(raw_format, "raw")
+
+    def test_runner_rejects_forced_chat_without_template(self):
+        with self.assertRaisesRegex(ValueError, "no chat template"):
+            format_prompts(SimpleNamespace(chat_template=None), ["hello"], "chat", False)
 
 
 if __name__ == "__main__":

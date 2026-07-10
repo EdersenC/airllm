@@ -120,7 +120,8 @@ class AirLLMBaseModel:
                  layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
                  live_stats_interval=0.25, cuda_copy_stream=True,
                  cpu_layer_cache_gib=0.0, persistent_gpu_residency=False,
-                 awq_backend=None, decoder_layer_count=None):
+                 awq_backend=None, decoder_layer_count=None,
+                 decoder_layer_indices=None):
         """
         Parameters
         ----------
@@ -176,6 +177,10 @@ class AirLLMBaseModel:
             across the original stack while retaining the first and last blocks. The retained
             layers are compacted and their KV-cache indices are renumbered. Omitting this value
             executes the complete checkpoint.
+        decoder_layer_indices: list[int], optional
+            explicit, strictly increasing source-layer indices to retain. This overrides even
+            sampling and is intended for calibrated importance profiles. When
+            ``decoder_layer_count`` is also supplied, it must match the list length.
         """
 
         if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
@@ -196,6 +201,23 @@ class AirLLMBaseModel:
                 or isinstance(decoder_layer_count, bool)
                 or decoder_layer_count < 1):
             raise ValueError("decoder_layer_count must be a positive integer or None")
+        if decoder_layer_indices is not None:
+            if not isinstance(decoder_layer_indices, (list, tuple)) \
+                    or not decoder_layer_indices:
+                raise ValueError("decoder_layer_indices must be a non-empty list or tuple")
+            if any(
+                    not isinstance(index, int) or isinstance(index, bool) or index < 0
+                    for index in decoder_layer_indices):
+                raise ValueError("decoder_layer_indices must contain non-negative integers")
+            decoder_layer_indices = list(decoder_layer_indices)
+            if decoder_layer_indices != sorted(set(decoder_layer_indices)):
+                raise ValueError("decoder_layer_indices must be unique and strictly increasing")
+            if decoder_layer_count is None:
+                decoder_layer_count = len(decoder_layer_indices)
+            elif decoder_layer_count != len(decoder_layer_indices):
+                raise ValueError(
+                    "decoder_layer_count must match the length of decoder_layer_indices"
+                )
         if awq_backend is not None:
             if not isinstance(awq_backend, str) or not awq_backend.strip():
                 raise TypeError("awq_backend must be a non-empty string or None")
@@ -227,6 +249,7 @@ class AirLLMBaseModel:
         self.persistent_gpu_residency = persistent_gpu_residency
         self.awq_backend = awq_backend
         self.requested_decoder_layer_count = decoder_layer_count
+        self.requested_decoder_layer_indices = decoder_layer_indices
         self._quantizer_postprocess_started = False
         self._quantizer_postprocessed = False
 
@@ -398,8 +421,19 @@ class AirLLMBaseModel:
         layers_attr = prefix_parts[-1]
         original_layers = getattr(parent, layers_attr)
         original_count = len(original_layers)
-        selected_indices = self._select_evenly_spaced_layers(
-            original_count, self.requested_decoder_layer_count)
+        if self.requested_decoder_layer_indices is None:
+            selected_indices = self._select_evenly_spaced_layers(
+                original_count, self.requested_decoder_layer_count)
+            self.decoder_layer_selection = "all" if len(selected_indices) == original_count \
+                else "even"
+        else:
+            selected_indices = list(self.requested_decoder_layer_indices)
+            if selected_indices[-1] >= original_count:
+                raise ValueError(
+                    f"decoder_layer_indices contains {selected_indices[-1]}, but the checkpoint "
+                    f"only has {original_count} decoder layers"
+                )
+            self.decoder_layer_selection = "explicit"
 
         self.original_decoder_layer_count = original_count
         self.decoder_layer_indices = selected_indices
@@ -1092,6 +1126,7 @@ class AirLLMBaseModel:
             "original_decoder_layer_count": self.original_decoder_layer_count,
             "decoder_layer_count": self.decoder_layer_count,
             "decoder_layer_indices": list(self.decoder_layer_indices),
+            "decoder_layer_selection": self.decoder_layer_selection,
             "layers_per_gpu_group": self.layers_per_gpu_group,
             "prefetch_groups": self.prefetch_groups,
             "cuda_copy_stream": self.cuda_copy_stream,

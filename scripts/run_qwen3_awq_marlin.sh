@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${AIRLLM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 PYTHON_BIN_DIR="$(dirname -- "${PYTHON}")"
+LAYER_PROFILE="${ROOT_DIR}/benchmarks/profiles/qwen3-4b-awq-block-influence.json"
 
 if [[ ! -x "${PYTHON}" ]]; then
     echo "AirLLM Python environment not found: ${PYTHON}" >&2
@@ -70,6 +71,11 @@ if [[ "${1:-}" == "--context-limit-benchmark" ]]; then
         "$@"
 fi
 
+if [[ "${1:-}" == "--calibrate-layer-profile" ]]; then
+    shift
+    exec "${PYTHON}" "${ROOT_DIR}/benchmarks/calibrate_block_influence.py" "$@"
+fi
+
 if [[ "${1:-}" == "--benchmark" ]]; then
     shift
     exec "${PYTHON}" "${ROOT_DIR}/benchmarks/benchmark_group_streaming.py" \
@@ -81,7 +87,13 @@ if [[ "${1:-}" == "--benchmark" ]]; then
         --persistent-gpu-residency \
         --awq-backend marlin \
         --cache-implementation dynamic \
+        --decoder-layer-profile "${LAYER_PROFILE}" \
         "$@"
+fi
+
+if [[ "${1:-}" == "--quality-reduced" ]]; then
+    shift
+    set -- --decoder-layer-count 31 "$@"
 fi
 
 USE_PERSISTENT_RESIDENCY=true
@@ -103,6 +115,7 @@ exec "${PYTHON}" "${ROOT_DIR}/scripts/run_qwen3_awq.py" \
     --cpu-layer-cache-gib 16 \
     "${RESIDENCY_ARGS[@]}" \
     --cache-implementation dynamic \
+    --decoder-layer-profile "${LAYER_PROFILE}" \
     --max-input-tokens 40704 \
     --max-new-tokens 256 \
     "$@"

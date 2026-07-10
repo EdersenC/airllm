@@ -153,6 +153,7 @@ class TestGroupStreaming(unittest.TestCase):
         model.config = config
         model.layer_names_dict = {"layer_prefix": "model.layers"}
         model.requested_decoder_layer_count = 3
+        model.requested_decoder_layer_indices = None
 
         model._configure_decoder_layer_selection()
 
@@ -168,6 +169,26 @@ class TestGroupStreaming(unittest.TestCase):
             [0, 1, 2],
         )
         self.assertTrue(base_model.has_sliding_layers)
+
+    def test_explicit_layer_selection_preserves_profile_order_and_renumbers_cache(self):
+        model = object.__new__(AirLLMBaseModel)
+        decoder_layers = nn.ModuleList([self._DecoderLayer(index) for index in range(6)])
+        base_model = SimpleNamespace(layers=decoder_layers)
+        config = SimpleNamespace(num_hidden_layers=6, layer_types=None)
+        model.model = SimpleNamespace(model=base_model, config=config)
+        model.config = config
+        model.layer_names_dict = {"layer_prefix": "model.layers"}
+        model.requested_decoder_layer_count = 3
+        model.requested_decoder_layer_indices = [0, 4, 5]
+
+        model._configure_decoder_layer_selection()
+
+        self.assertEqual(model.decoder_layer_indices, [0, 4, 5])
+        self.assertEqual(model.decoder_layer_selection, "explicit")
+        self.assertEqual(
+            [layer.self_attn.layer_idx for layer in base_model.layers],
+            [0, 1, 2],
+        )
 
     def test_reduced_depth_remaps_original_shard_to_runtime_layer(self):
         model = object.__new__(AirLLMBaseModel)

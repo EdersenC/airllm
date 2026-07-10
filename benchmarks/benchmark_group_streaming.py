@@ -21,6 +21,18 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.layer_profiles import (  # noqa: E402 - keep dry-run independent of AirLLM imports
+    LayerProfileError,
+    load_layer_profile,
+    parse_layer_indices,
+    select_profile_layers,
+    validate_profile_identity,
+)
+
 
 DEFAULT_MODEL_PATH = Path("/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ")
 DEFAULT_PROMPT = "Explain why layer streaming can reduce peak GPU memory usage in one paragraph."
@@ -85,6 +97,13 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def layer_indices_arg(value: str) -> list[int]:
+    try:
+        return parse_layer_indices(value)
+    except LayerProfileError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -114,9 +133,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=None,
         help=(
-            "Experimental reduced-depth mode: retain this many evenly spaced decoder "
-            "layers from the original checkpoint. Omit to run every layer."
+            "Experimental reduced-depth mode: retain this many decoder layers. A supplied "
+            "Block Influence profile chooses them; otherwise AirLLM samples evenly."
         ),
+    )
+    parser.add_argument(
+        "--decoder-layer-indices",
+        type=layer_indices_arg,
+        default=None,
+        help="Explicit comma-separated source-layer indices to retain.",
+    )
+    parser.add_argument(
+        "--decoder-layer-profile",
+        type=Path,
+        default=None,
+        help="Block Influence JSON used for layer ranking and its measured quality floor.",
+    )
+    parser.add_argument(
+        "--allow-unsafe-layer-drop",
+        action="store_true",
+        help="Bypass a profile's quality floor for speed-only broken-output experiments.",
     )
     parser.add_argument(
         "--prefetch-groups",
@@ -640,6 +676,11 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "device_requested": args.device,
         "group_size": args.group_size,
         "decoder_layer_count": args.decoder_layer_count,
+        "decoder_layer_indices": args.decoder_layer_indices,
+        "decoder_layer_profile": (
+            str(args.decoder_layer_profile) if args.decoder_layer_profile is not None else None
+        ),
+        "allow_unsafe_layer_drop": args.allow_unsafe_layer_drop,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
@@ -661,10 +702,47 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
+def resolve_decoder_layer_selection(args: argparse.Namespace) -> tuple[list[int] | None, dict | None]:
+    if args.decoder_layer_count is None and args.decoder_layer_indices is None:
+        return None, None
+
+    selected_count = args.decoder_layer_count
+    if args.decoder_layer_indices is not None:
+        if selected_count is None:
+            selected_count = len(args.decoder_layer_indices)
+            args.decoder_layer_count = selected_count
+        elif selected_count != len(args.decoder_layer_indices):
+            raise LayerProfileError(
+                "--decoder-layer-count must match --decoder-layer-indices length"
+            )
+
+    profile = load_layer_profile(args.decoder_layer_profile) \
+        if args.decoder_layer_profile is not None else None
+    if profile is not None:
+        profile_indices = select_profile_layers(
+            profile,
+            selected_count,
+            allow_unsafe=args.allow_unsafe_layer_drop,
+        )
+        if args.decoder_layer_indices is None:
+            return profile_indices, profile
+        if args.decoder_layer_indices != profile_indices and not args.allow_unsafe_layer_drop:
+            raise LayerProfileError(
+                "explicit layer indices differ from the calibrated profile; use "
+                "--allow-unsafe-layer-drop to run an unvalidated selection"
+            )
+    return args.decoder_layer_indices, profile
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.min_new_tokens > args.max_new_tokens:
         raise SystemExit("--min-new-tokens cannot exceed --max-new-tokens")
+    try:
+        decoder_layer_indices, layer_profile = resolve_decoder_layer_selection(args)
+    except LayerProfileError as exc:
+        raise SystemExit(str(exc)) from exc
+    args.decoder_layer_indices = decoder_layer_indices
     prompts, prompt_source = read_prompts(args)
     batches, padded_count = build_prompt_batches(prompts, args.prompt_batch_size)
 
@@ -687,6 +765,12 @@ def main() -> int:
     print(f"device: {device}")
     print(f"group_size: {args.group_size}")
     print(f"decoder_layer_count: {args.decoder_layer_count or 'all'}")
+    print(f"decoder_layer_selection: {args.decoder_layer_indices or 'all/even'}")
+    print(
+        "decoder_layer_profile: "
+        f"{layer_profile['profile_path'] if layer_profile is not None else 'none'}"
+    )
+    print(f"allow_unsafe_layer_drop: {args.allow_unsafe_layer_drop}")
     print(f"prefetch_groups: {args.prefetch_groups}")
     print(f"prefetching: {not args.no_prefetch}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
@@ -700,6 +784,7 @@ def main() -> int:
         "device": str(device),
         "layers_per_gpu_group": args.group_size,
         "decoder_layer_count": args.decoder_layer_count,
+        "decoder_layer_indices": args.decoder_layer_indices,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
@@ -711,6 +796,18 @@ def main() -> int:
         model_kwargs["layer_shards_saving_path"] = str(args.layer_shards_path.expanduser())
     model = AutoModel.from_pretrained(str(model_path), **model_kwargs)
     initial_runtime_stats = model.get_runtime_stats()
+    if layer_profile is not None:
+        try:
+            validate_profile_identity(
+                layer_profile,
+                original_decoder_layer_count=initial_runtime_stats[
+                    "original_decoder_layer_count"
+                ],
+                resolved_model_path=model.model_local_path,
+            )
+        except LayerProfileError as exc:
+            model.close()
+            raise SystemExit(str(exc)) from exc
     print(
         "active_decoder_layers: "
         f"{initial_runtime_stats['decoder_layer_count']}/"
@@ -739,6 +836,11 @@ def main() -> int:
         "decoder_layer_count": initial_runtime_stats["decoder_layer_count"],
         "original_decoder_layer_count": initial_runtime_stats["original_decoder_layer_count"],
         "decoder_layer_indices": initial_runtime_stats["decoder_layer_indices"],
+        "decoder_layer_selection": initial_runtime_stats["decoder_layer_selection"],
+        "decoder_layer_profile": (
+            layer_profile["profile_path"] if layer_profile is not None else None
+        ),
+        "allow_unsafe_layer_drop": args.allow_unsafe_layer_drop,
         "prefetch_groups": args.prefetch_groups,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
