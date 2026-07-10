@@ -77,19 +77,22 @@ toolchain listed in the top-level README), add persistent residency and Marlin:
   --repeats 3
 ```
 
-For the fastest reduced stack that passed the local output sanity gate, use the
-prepared quality mode. It loads 31 of 36 blocks selected by Qwen's calibrated
-Block Influence ranking and applies the tokenizer's chat template:
+The prepared launcher now defaults to the large-model simulation: 12 decoder
+layers resident per GPU group, all 36 model layers executed, persistent full-model
+residency disabled, 8-group prefetch, and a 16 GiB CPU layer-cache budget.
 
 ```bash
-./scripts/run_qwen3_awq_marlin.sh --quality-reduced \
+./scripts/run_qwen3_awq_marlin.sh --benchmark \
   --max-new-tokens 128 \
-  --no-live-stats
+  --min-new-tokens 128 \
+  --warmup 1 \
+  --repeats 3
 ```
 
-The profile is tied to the exact local model snapshot. The launcher refuses a
-different snapshot or a count below 31 unless the run is explicitly marked
-unsafe.
+`--layers-per-gpu-group` controls simultaneous GPU residency. It does not prune
+or skip model layers.
+
+### Research-only model-depth pruning
 
 To compare the full 36-layer checkpoint against half depth and one-third depth,
 run the same benchmark three times and force an equal decode length. This is a

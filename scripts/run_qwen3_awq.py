@@ -59,9 +59,9 @@ def parse_args():
     parser.add_argument("--max-input-tokens", type=int, default=512,
                         help="Tokenizer truncation limit for each prompt")
     parser.add_argument("--layers-per-gpu-group", type=int, default=1,
-                        help="Consecutive decoder layers to keep on GPU at once")
+                        help="Consecutive decoder layers resident on GPU at once; every model layer still executes")
     parser.add_argument("--decoder-layer-count", type=int, default=None,
-                        help="Experimental decoder layers to retain; profile ranking is preferred")
+                        help="Experimental model-depth pruning; skips trained blocks and is unrelated to GPU group size")
     parser.add_argument("--decoder-layer-indices", type=layer_indices_arg, default=None,
                         help="Explicit comma-separated source-layer indices to retain")
     parser.add_argument("--decoder-layer-profile", type=Path, default=DEFAULT_LAYER_PROFILE,
@@ -339,8 +339,8 @@ def main():
     batch_size = args.batch_size or len(prompts)
     print(f"model: {args.model_cache}")
     print(f"device: {device}")
-    print(f"layers_per_gpu_group: {args.layers_per_gpu_group}")
-    print(f"decoder_layer_count: {args.decoder_layer_count or 'all'}")
+    print(f"gpu_resident_decoder_layers_per_group: {args.layers_per_gpu_group}")
+    print(f"requested_model_decoder_layers: {args.decoder_layer_count or 'all'}")
     print(
         "decoder_layer_profile: "
         f"{layer_profile['profile_path'] if layer_profile is not None else 'none'}"
@@ -383,7 +383,7 @@ def main():
             model.close()
             raise SystemExit(str(exc)) from exc
     print(
-        "active_decoder_layers: "
+        "model_decoder_layers_executed: "
         f"{runtime_stats['decoder_layer_count']}/{runtime_stats['original_decoder_layer_count']} "
         f"source_indices={runtime_stats['decoder_layer_indices']}"
     )

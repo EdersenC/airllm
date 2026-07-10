@@ -116,20 +116,23 @@ Then use the prepared launcher:
 ./scripts/run_qwen3_awq_marlin.sh
 ```
 
-It enables persistent GPU residency, the Marlin AWQ kernel, 24-layer groups,
-8-group prefetch, a 16 GiB CPU-cache budget, dynamic KV, live stats, and 256
-new tokens with a 40,704-token prompt cap. The CPU shard cache is automatically released after all weights are
-resident. The first run compiles Marlin for the installed GPU and can take a few
-minutes; later runs reuse `~/.cache/airllm/gptqmodel-torch-extensions`. Add
+It executes every model layer while keeping at most 12 consecutive decoder
+layers on the GPU at once. It also enables 8-group prefetch, a 16 GiB CPU-cache
+budget, a dedicated CUDA copy stream, dynamic KV, live stats, and 256 new tokens
+with a 40,704-token prompt cap. This is the large-model streaming path: changing
+the GPU group size changes residency and transfer batching, not model depth. Add
 `--max-new-tokens 64`, `--no-live-stats`, or any normal runner option to override
 the launcher defaults.
 
-If the model or desired KV cache does not fit, the same launcher can fall back
-to normal grouped streaming (and a CPU-compatible AWQ kernel):
+For a small checkpoint that completely fits in VRAM, full residency and Marlin
+remain an explicit faster option:
 
 ```bash
-./scripts/run_qwen3_awq_marlin.sh --no-persistent-gpu-residency
+./scripts/run_qwen3_awq_marlin.sh --persistent-gpu-residency
 ```
+
+Do not use `--decoder-layer-count` to control VRAM residency. That experimental
+option removes trained blocks from the network and can destroy output quality.
 
 To reproduce the exact native 40,960-token context stress test and write a JSON
 report under `benchmarks/results/`, run:
@@ -142,13 +145,13 @@ Persistent residency is intentionally opt-in: use it only when the checkpoint
 plus the required KV cache fit in VRAM. Ordinary grouped streaming remains the
 safe path for larger checkpoints.
 
-For the tested 12 GB RTX 5070 setup, keep 24 decoder layers resident, retain the
+For the tested 12 GB RTX 5070 setup, keep 12 decoder layers resident, retain the
 complete Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next
 group on a dedicated CUDA stream, and use a realistic dynamic KV cache:
 
 ```bash
 .venv/bin/python scripts/run_qwen3_awq.py \
-  --layers-per-gpu-group 24 \
+  --layers-per-gpu-group 12 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
   --cache-implementation dynamic \
@@ -162,7 +165,7 @@ Prompt batching is supported by repeating `--prompt`, loading one prompt per lin
   --prompt "Explain CUDA streams" \
   --prompt "Explain KV caching" \
   --batch-size 2 \
-  --layers-per-gpu-group 24 \
+  --layers-per-gpu-group 12 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
   --cache-implementation dynamic

@@ -5,6 +5,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${AIRLLM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 PYTHON_BIN_DIR="$(dirname -- "${PYTHON}")"
 LAYER_PROFILE="${ROOT_DIR}/benchmarks/profiles/qwen3-4b-awq-block-influence.json"
+GPU_LAYER_GROUP_SIZE="${AIRLLM_GPU_LAYER_GROUP_SIZE:-12}"
 
 if [[ ! -x "${PYTHON}" ]]; then
     echo "AirLLM Python environment not found: ${PYTHON}" >&2
@@ -64,7 +65,7 @@ export TORCH_FORCE_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_WEIGHTS_ONLY_LOAD:-1}"
 if [[ "${1:-}" == "--context-limit-benchmark" ]]; then
     shift
     exec "${PYTHON}" "${ROOT_DIR}/benchmarks/benchmark_context_limit.py" \
-        --layers-per-gpu-group 24 \
+        --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
         --prefetch-groups 8 \
         --cpu-layer-cache-gib 16 \
         --awq-backend marlin \
@@ -81,22 +82,23 @@ if [[ "${1:-}" == "--benchmark" ]]; then
     exec "${PYTHON}" "${ROOT_DIR}/benchmarks/benchmark_group_streaming.py" \
         --model-path /mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ \
         --device cuda:0 \
-        --layers-per-gpu-group 24 \
+        --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
         --prefetch-groups 8 \
         --cpu-layer-cache-gib 16 \
-        --persistent-gpu-residency \
-        --awq-backend marlin \
+        --no-persistent-gpu-residency \
+        --awq-backend auto \
         --cache-implementation dynamic \
         --decoder-layer-profile "${LAYER_PROFILE}" \
         "$@"
 fi
 
 if [[ "${1:-}" == "--quality-reduced" ]]; then
-    shift
-    set -- --decoder-layer-count 31 "$@"
+    echo "--quality-reduced was removed from the normal launcher because it skips trained model layers." >&2
+    echo "Use --layers-per-gpu-group ${GPU_LAYER_GROUP_SIZE} to limit simultaneous GPU residency while still executing every layer." >&2
+    exit 2
 fi
 
-USE_PERSISTENT_RESIDENCY=true
+USE_PERSISTENT_RESIDENCY=false
 for argument in "$@"; do
     case "${argument}" in
         --persistent-gpu-residency) USE_PERSISTENT_RESIDENCY=true ;;
@@ -110,7 +112,7 @@ else
 fi
 
 exec "${PYTHON}" "${ROOT_DIR}/scripts/run_qwen3_awq.py" \
-    --layers-per-gpu-group 24 \
+    --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
     --prefetch-groups 8 \
     --cpu-layer-cache-gib 16 \
     "${RESIDENCY_ARGS[@]}" \
