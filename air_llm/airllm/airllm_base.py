@@ -51,17 +51,25 @@ class _LiveStats:
         now = time.monotonic()
         if not force and now - self.last_emit_at < self.interval:
             return
-        if force and not self.interactive and phase == "compute" \
+        if force and not self.interactive and phase in {"compute", "release", "resident"} \
                 and now - self.last_emit_at < self.interval:
             return
 
         elapsed = now - self.started_at
         sequence = sequence_length if sequence_length is not None else "?"
+        step_tps = forward / elapsed if elapsed > 0 and forward else 0.0
+        aggregate_tps = (
+            step_tps * batch_size
+            if isinstance(batch_size, int) and not isinstance(batch_size, bool) else None
+        )
+        throughput = f"steps/s={step_tps:.2f}"
+        if aggregate_tps is not None:
+            throughput += f" aggregate_tok/s~={aggregate_tps:.2f}"
         line = (
             f"[AirLLM] forward={forward} batch={batch_size} seq={sequence} "
             f"phase={phase} group={group_id + 1}/{group_count} "
             f"layers={layers} current={current_layer} "
-            f"prefetch={prefetch} elapsed={elapsed:.1f}s"
+            f"prefetch={prefetch} {throughput} elapsed={elapsed:.1f}s"
         )
         if self.interactive:
             padding = max(0, self.last_line_length - len(line))
@@ -85,12 +93,19 @@ class AirLLMBaseModel:
     logic. AirLLM only attaches forward hooks to each big module (embeddings, every decoder
     layer, the final norm and the lm_head) to stream groups of module weights disk -> GPU right
     before they run and free the whole group after the last module, prefetching the next group
-    on a worker thread.
+    on a worker thread. When the complete checkpoint fits in VRAM, persistent GPU residency can
+    materialize every group once and retain it across autoregressive decode steps.
 
     Because transformers drives the forward pass, AirLLM no longer needs to track per-architecture
     attention/rotary/cache details: new model architectures work as soon as transformers supports
     them.
     """
+
+    _AWQ_BACKENDS = {
+        "autoawq", "auto", "auto_trainable", "machete", "marlin",
+        "exllama_v2", "exllama_v1", "gemm", "gemm_triton", "gemv",
+        "gemv_fast", "torch_awq", "torch_fused_awq",
+    }
 
     # Subclasses override this to point at non-standard module names.
     def set_layer_names_dict(self):
@@ -104,7 +119,8 @@ class AirLLMBaseModel:
                  hf_token=None, prefetching=True, delete_original=False,
                  layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
                  live_stats_interval=0.25, cuda_copy_stream=True,
-                 cpu_layer_cache_gib=0.0):
+                 cpu_layer_cache_gib=0.0, persistent_gpu_residency=False,
+                 awq_backend=None):
         """
         Parameters
         ----------
@@ -146,6 +162,15 @@ class AirLLMBaseModel:
             bounded CPU RAM budget for retaining layer shards across forward passes.
             Cached tensors are pinned when prefetching is enabled so the CUDA copy
             stream can reuse them without another disk read or staging copy.
+        persistent_gpu_residency: bool, optional
+            preload every streaming group and keep the complete model on the GPU across
+            forward passes. This is substantially faster for models that fit in VRAM but
+            intentionally remains opt-in so oversized checkpoints retain AirLLM's normal
+            low-memory streaming behavior.
+        awq_backend: str, optional
+            explicit GPTQModel kernel for an AWQ checkpoint. ``marlin`` requires persistent
+            GPU residency because its one-time weight repack is not compatible with eviction
+            and reloading raw AWQ layer shards.
         """
 
         if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
@@ -159,6 +184,19 @@ class AirLLMBaseModel:
         if isinstance(cpu_layer_cache_gib, bool) or not isinstance(
                 cpu_layer_cache_gib, (int, float)) or cpu_layer_cache_gib < 0:
             raise ValueError("cpu_layer_cache_gib must be a non-negative number")
+        if not isinstance(persistent_gpu_residency, bool):
+            raise TypeError("persistent_gpu_residency must be a boolean")
+        if awq_backend is not None:
+            if not isinstance(awq_backend, str) or not awq_backend.strip():
+                raise TypeError("awq_backend must be a non-empty string or None")
+            awq_backend = awq_backend.strip().lower()
+            if awq_backend not in self._AWQ_BACKENDS:
+                raise ValueError(
+                    f"unsupported AWQ backend {awq_backend!r}; "
+                    f"choose one of {sorted(self._AWQ_BACKENDS)}"
+                )
+            if awq_backend == "marlin" and not persistent_gpu_residency:
+                raise ValueError("awq_backend='marlin' requires persistent_gpu_residency=True")
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
@@ -176,6 +214,10 @@ class AirLLMBaseModel:
         self.hf_token = hf_token
         self.layers_per_gpu_group = layers_per_gpu_group
         self.prefetch_groups = prefetch_groups
+        self.persistent_gpu_residency = persistent_gpu_residency
+        self.awq_backend = awq_backend
+        self._quantizer_postprocess_started = False
+        self._quantizer_postprocessed = False
 
         self.set_layer_names_dict()
 
@@ -189,6 +231,8 @@ class AirLLMBaseModel:
 
         self.running_device = device
         self.device = torch.device(self.running_device)
+        if self.persistent_gpu_residency and self.device.type != "cuda":
+            raise ValueError("persistent_gpu_residency currently requires a CUDA device")
 
         # Prefer transformers' native implementation; only trust the model's bundled remote code when
         # transformers doesn't recognize the architecture. Vendored remote code is frequently pinned
@@ -203,6 +247,8 @@ class AirLLMBaseModel:
             self.config = AutoConfig.from_pretrained(
                 self.model_local_path, trust_remote_code=True, **token_kwargs)
             self.trust_remote_code = True
+
+        self._configure_awq_backend()
 
         # Default to the model's native dtype (bf16 for most modern models). Forcing fp16 overflows
         # on deep models (e.g. Qwen3-235B's 94 layers) and produces garbage; bf16's wider range
@@ -237,7 +283,7 @@ class AirLLMBaseModel:
             max_gib=float(cpu_layer_cache_gib),
             pin_memory=self.prefetching and self.device.type == "cuda",
         )
-        self._resident_group_id = None
+        self._resident_group_ids = set()
         self._forward_count = 0
         self._live_batch_size = "?"
         self._live_sequence_length = "?"
@@ -260,6 +306,8 @@ class AirLLMBaseModel:
 
         self.set_layers_from_layer_names()
         self._install_streaming_hooks()
+        if self.persistent_gpu_residency:
+            self._materialize_persistent_model()
 
     # ---- customization hooks for subclasses -------------------------------------------------
 
@@ -274,6 +322,28 @@ class AirLLMBaseModel:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+
+    def _configure_awq_backend(self):
+        if self.awq_backend is None:
+            return
+
+        quantization_config = getattr(self.config, "quantization_config", None)
+        if quantization_config is None:
+            raise ValueError("awq_backend was provided, but the checkpoint is not quantized")
+        if not isinstance(quantization_config, dict):
+            quantization_config = quantization_config.to_dict()
+
+        quant_method = quantization_config.get("quant_method")
+        if hasattr(quant_method, "value"):
+            quant_method = quant_method.value
+        if str(quant_method).lower() != "awq":
+            raise ValueError(
+                f"awq_backend only applies to AWQ checkpoints; found quant_method={quant_method!r}"
+            )
+
+        quantization_config = dict(quantization_config)
+        quantization_config["backend"] = self.awq_backend
+        self.config.quantization_config = quantization_config
 
     # ---- model construction -----------------------------------------------------------------
 
@@ -298,8 +368,12 @@ class AirLLMBaseModel:
         quantization_config = getattr(self.config, "quantization_config", None)
         if quantization_config is not None:
             self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
-            device_map = self.hf_quantizer.update_device_map(None)
+            device_map = (
+                {"": self.running_device}
+                if self.persistent_gpu_residency else self.hf_quantizer.update_device_map(None)
+            )
             self.hf_quantizer.preprocess_model(model=self.model, device_map=device_map)
+            self.model.hf_quantizer = self.hf_quantizer
 
         self.model.eval()
         self.model.tie_weights()
@@ -452,11 +526,61 @@ class AirLLMBaseModel:
             for group_id, group in enumerate(self._streaming_groups)
         }
 
+        self._streaming_hook_handles = []
+        self._persistent_model_hook_handles = []
         for idx in self._streamed_indices:
             module = self.layers[idx]
             module._airllm_idx = idx
-            module.register_forward_pre_hook(self._pre_hook)
-            module.register_forward_hook(self._post_hook)
+            self._streaming_hook_handles.append(module.register_forward_pre_hook(self._pre_hook))
+            self._streaming_hook_handles.append(module.register_forward_hook(self._post_hook))
+
+    def _remove_streaming_hooks(self):
+        for handle in self._streaming_hook_handles:
+            handle.remove()
+        self._streaming_hook_handles = []
+
+    def _install_persistent_runtime_hooks(self):
+        self._persistent_model_hook_handles = [
+            self.model.register_forward_pre_hook(
+                self._persistent_model_pre_hook, with_kwargs=True),
+            self.model.register_forward_hook(
+                self._persistent_model_post_hook, with_kwargs=True),
+        ]
+
+    def _persistent_model_pre_hook(self, module, args, kwargs):
+        self._forward_count += 1
+        inputs = kwargs.get("input_ids")
+        if inputs is None:
+            inputs = kwargs.get("inputs_embeds")
+        if inputs is None and args:
+            inputs = args[0]
+        try:
+            self._live_batch_size = int(inputs.shape[0])
+            self._live_sequence_length = int(inputs.shape[1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            self._live_batch_size = "?"
+            self._live_sequence_length = "?"
+        self._runtime_stats["resident_group_hits"] += len(self._streaming_groups)
+        self._persistent_compute_started = time.perf_counter()
+        if self._live_stats.enabled:
+            self._live_stats.emit(
+                forward=self._forward_count,
+                batch_size=self._live_batch_size,
+                sequence_length=self._live_sequence_length,
+                group_id=0,
+                group_count=len(self._streaming_groups),
+                layers=f"all {len(self._streamed_indices)} streamed modules resident",
+                current_layer="full-model forward",
+                phase="decode",
+                prefetch=f"resident:{len(self._resident_group_ids)}",
+            )
+
+    def _persistent_model_post_hook(self, module, args, kwargs, output):
+        if self._persistent_compute_started is not None:
+            self._runtime_stats["group_compute_seconds"] += (
+                time.perf_counter() - self._persistent_compute_started)
+            self._persistent_compute_started = None
+        return output
 
     @staticmethod
     def _build_streaming_groups(layer_count, tie_word_embeddings, layers_per_gpu_group):
@@ -603,7 +727,7 @@ class AirLLMBaseModel:
         self._group_copy_events[group_id] = end_event
         self._runtime_stats["groups_loaded"] += 1
         self._runtime_stats["cuda_prefetched_groups"] += 1
-        self._resident_group_id = group_id
+        self._resident_group_ids.add(group_id)
         return True, None
 
     def _prefetch_status(self):
@@ -640,13 +764,14 @@ class AirLLMBaseModel:
         self._release_group_modules(group_id)
         self._group_cpu_sources.pop(group_id, None)
         self._group_copy_events.pop(group_id, None)
-        if self._resident_group_id == group_id:
-            self._resident_group_id = None
+        self._resident_group_ids.discard(group_id)
 
     def _release_group_modules(self, group_id):
         for idx in self._streaming_groups[group_id]:
             module = self.layers[idx]
-            if self.hf_quantizer is not None:
+            if self._quantizer_postprocess_started:
+                module.to('meta')
+            elif self.hf_quantizer is not None:
                 for param_name in getattr(module, '_airllm_moved', []):
                     set_module_tensor_to_device(self.model, param_name, 'meta')
             else:
@@ -676,10 +801,42 @@ class AirLLMBaseModel:
 
         self._runtime_stats["group_gpu_load_seconds"] += time.perf_counter() - gpu_load_started
         self._runtime_stats["groups_loaded"] += 1
-        self._resident_group_id = group_id
+        self._resident_group_ids.add(group_id)
         self._schedule_group_prefetch(group_id)
         self._schedule_cuda_group_prefetch(group_id)
         self._emit_live_stats(group_id, first_idx, "ready", force=True)
+
+    def _materialize_persistent_model(self):
+        """Load every group once, then initialize kernels that require complete weights."""
+        try:
+            for group_id in range(len(self._streaming_groups)):
+                if group_id not in self._resident_group_ids:
+                    self._load_group_to_device(group_id)
+            self._cancel_prefetch_futures()
+
+            if self.hf_quantizer is not None:
+                self._quantizer_postprocess_started = True
+                self.hf_quantizer.postprocess_model(self.model)
+                self._quantizer_postprocessed = True
+
+            torch.cuda.synchronize(self.device)
+
+            # Once all weights are resident, raw CPU shards and copy-event references are
+            # redundant. Releasing them returns the pinned cache budget to the OS while the
+            # transformed GPU parameters remain available for every decode step.
+            self._group_cpu_sources.clear()
+            self._group_copy_events.clear()
+            self.cpu_layer_cache.clear()
+            self._remove_streaming_hooks()
+            self._install_persistent_runtime_hooks()
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, torch.cuda.OutOfMemoryError):
+                raise RuntimeError(
+                    "persistent GPU residency does not fit in available VRAM; disable "
+                    "persistent_gpu_residency to use normal grouped streaming"
+                ) from exc
+            raise
 
     def _pre_hook(self, module, args):
         idx = module._airllm_idx
@@ -695,11 +852,15 @@ class AirLLMBaseModel:
                 self._live_batch_size = "?"
                 self._live_sequence_length = "?"
 
-        if self._resident_group_id != group_id:
-            if self._resident_group_id is not None:
-                self._unload_group(self._resident_group_id)
+        group_first_idx = self._streaming_groups[group_id][0]
+        if group_id not in self._resident_group_ids:
+            if not self.persistent_gpu_residency:
+                for resident_group_id in tuple(self._resident_group_ids):
+                    self._unload_group(resident_group_id)
             self._load_group_to_device(group_id)
-        if idx == self._streaming_groups[group_id][0]:
+        elif self.persistent_gpu_residency and idx == group_first_idx:
+            self._runtime_stats["resident_group_hits"] += 1
+        if idx == group_first_idx:
             self._group_compute_started[group_id] = time.perf_counter()
         self._emit_live_stats(group_id, idx, "compute", args=args)
 
@@ -710,8 +871,11 @@ class AirLLMBaseModel:
             compute_started = self._group_compute_started.pop(group_id, None)
             if compute_started is not None:
                 self._runtime_stats["group_compute_seconds"] += time.perf_counter() - compute_started
-            self._emit_live_stats(group_id, idx, "release", force=True)
-            self._unload_group(group_id)
+            if self.persistent_gpu_residency:
+                self._emit_live_stats(group_id, idx, "resident", force=True)
+            else:
+                self._emit_live_stats(group_id, idx, "release", force=True)
+                self._unload_group(group_id)
         return output
 
     # ---- delegation to the underlying transformers model ------------------------------------
@@ -724,8 +888,10 @@ class AirLLMBaseModel:
             "group_copy_wait_seconds": 0.0,
             "group_compute_seconds": 0.0,
             "cuda_prefetched_groups": 0,
+            "resident_group_hits": 0,
         }
         self._group_compute_started = {}
+        self._persistent_compute_started = None
 
     def _cancel_prefetch_futures(self):
         cpu_futures = tuple(self._prefetch_futures.values())
@@ -752,9 +918,13 @@ class AirLLMBaseModel:
 
     def close(self):
         """Release resident weights and stop the CPU prefetch worker."""
+        self._remove_streaming_hooks()
+        for handle in self._persistent_model_hook_handles:
+            handle.remove()
+        self._persistent_model_hook_handles = []
         self._cancel_prefetch_futures()
-        if self._resident_group_id is not None:
-            self._unload_group(self._resident_group_id)
+        for resident_group_id in tuple(self._resident_group_ids):
+            self._unload_group(resident_group_id)
         if getattr(self, "tie_word_embeddings", False):
             if self.hf_quantizer is not None:
                 for param_name in self._resident_embedding_moved:
@@ -778,6 +948,27 @@ class AirLLMBaseModel:
         self.close()
         return False
 
+    def _active_awq_backend(self):
+        quantizer = self.hf_quantizer
+        quantization_config = (
+            getattr(quantizer, "quantization_config", None)
+            if quantizer is not None else getattr(self.config, "quantization_config", None)
+        )
+        if isinstance(quantization_config, dict):
+            backend = quantization_config.get("backend")
+        else:
+            backend = getattr(quantization_config, "backend", None)
+        if hasattr(backend, "value"):
+            backend = backend.value
+        return backend
+
+    def _active_quantized_kernel(self):
+        for module in self.model.modules():
+            module_path = module.__class__.__module__
+            if module_path.startswith("gptqmodel.nn_modules.qlinear"):
+                return module.__class__.__name__
+        return None
+
     def get_runtime_stats(self):
         """Return timing counters for the most recent generation call."""
         cache_stats = self.cpu_layer_cache.stats()
@@ -787,6 +978,13 @@ class AirLLMBaseModel:
             "layers_per_gpu_group": self.layers_per_gpu_group,
             "prefetch_groups": self.prefetch_groups,
             "cuda_copy_stream": self.cuda_copy_stream,
+            "persistent_gpu_residency": self.persistent_gpu_residency,
+            "persistent_groups_preloaded": (
+                len(self._streaming_groups) if self.persistent_gpu_residency else 0
+            ),
+            "resident_groups": len(self._resident_group_ids),
+            "awq_backend": self._active_awq_backend(),
+            "quantized_kernel": self._active_quantized_kernel(),
             "cpu_cache_hits": cache_stats.hits,
             "cpu_cache_misses": cache_stats.misses,
             "cpu_cache_evictions": cache_stats.evictions,
@@ -805,8 +1003,9 @@ class AirLLMBaseModel:
             return self.model.generate(*args, **kwargs)
         except BaseException:
             self._cancel_prefetch_futures()
-            if self._resident_group_id is not None:
-                self._unload_group(self._resident_group_id)
+            if not self.persistent_gpu_residency:
+                for resident_group_id in tuple(self._resident_group_ids):
+                    self._unload_group(resident_group_id)
             clean_memory()
             raise
         finally:

@@ -1,4 +1,8 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
 
 from ..airllm.airllm_base import AirLLMBaseModel
 
@@ -104,6 +108,139 @@ class TestGroupStreaming(unittest.TestCase):
             with self.subTest(group_size=group_size):
                 with self.assertRaises(ValueError):
                     AirLLMBaseModel._build_streaming_groups(6, True, group_size)
+
+    def test_awq_backend_override_is_copied_into_model_config(self):
+        model = object.__new__(AirLLMBaseModel)
+        original = {"quant_method": "awq", "bits": 4}
+        model.awq_backend = "marlin"
+        model.config = SimpleNamespace(quantization_config=original)
+
+        model._configure_awq_backend()
+
+        self.assertEqual(model.config.quantization_config["backend"], "marlin")
+        self.assertNotIn("backend", original)
+
+    def test_awq_backend_override_rejects_non_awq_checkpoint(self):
+        model = object.__new__(AirLLMBaseModel)
+        model.awq_backend = "marlin"
+        model.config = SimpleNamespace(quantization_config={"quant_method": "gptq"})
+
+        with self.assertRaisesRegex(ValueError, "only applies to AWQ"):
+            model._configure_awq_backend()
+
+    def test_persistent_pre_hook_reuses_resident_group(self):
+        model = object.__new__(AirLLMBaseModel)
+        module = SimpleNamespace(_airllm_idx=1)
+        model._streaming_groups = [[1, 2]]
+        model._group_by_idx = {1: 0, 2: 0}
+        model._resident_group_ids = {0}
+        model.persistent_gpu_residency = True
+        model._runtime_stats = {"resident_group_hits": 0}
+        model._group_compute_started = {}
+        model._forward_count = 0
+        model._live_batch_size = "?"
+        model._live_sequence_length = "?"
+        model._emit_live_stats = Mock()
+        model._load_group_to_device = Mock()
+        model._unload_group = Mock()
+
+        model._pre_hook(module, (SimpleNamespace(shape=(2, 7, 16)),))
+
+        self.assertEqual(model._runtime_stats["resident_group_hits"], 1)
+        self.assertEqual(model._forward_count, 1)
+        self.assertEqual(model._live_batch_size, 2)
+        self.assertEqual(model._live_sequence_length, 7)
+        model._load_group_to_device.assert_not_called()
+        model._unload_group.assert_not_called()
+
+    def test_persistent_post_hook_keeps_group_loaded(self):
+        model = object.__new__(AirLLMBaseModel)
+        module = SimpleNamespace(_airllm_idx=2)
+        model._group_by_idx = {2: 0}
+        model._group_last_idx = {0: 2}
+        model._group_compute_started = {0: 0.0}
+        model._runtime_stats = {"group_compute_seconds": 0.0}
+        model.persistent_gpu_residency = True
+        model._emit_live_stats = Mock()
+        model._unload_group = Mock()
+        output = object()
+
+        returned = model._post_hook(module, (), output)
+
+        self.assertIs(returned, output)
+        self.assertGreater(model._runtime_stats["group_compute_seconds"], 0.0)
+        model._unload_group.assert_not_called()
+        self.assertEqual(model._emit_live_stats.call_args.args[2], "resident")
+
+    def test_persistent_oom_closes_workers_and_reports_streaming_fallback(self):
+        model = object.__new__(AirLLMBaseModel)
+        model._streaming_groups = [[0]]
+        model._resident_group_ids = set()
+        model._load_group_to_device = Mock(side_effect=torch.cuda.OutOfMemoryError())
+        model.close = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "does not fit in available VRAM"):
+            model._materialize_persistent_model()
+
+        model.close.assert_called_once_with()
+
+    def test_persistent_materialization_always_replaces_layer_hooks(self):
+        model = object.__new__(AirLLMBaseModel)
+        model._streaming_groups = []
+        model._resident_group_ids = set()
+        model._cancel_prefetch_futures = Mock()
+        model.hf_quantizer = None
+        model.device = torch.device("cuda:0")
+        model._group_cpu_sources = {}
+        model._group_copy_events = {}
+        model.cpu_layer_cache = SimpleNamespace(clear=Mock())
+        model._remove_streaming_hooks = Mock()
+        model._install_persistent_runtime_hooks = Mock()
+        model._live_stats = SimpleNamespace(enabled=True)
+
+        with patch("air_llm.airllm.airllm_base.torch.cuda.synchronize"):
+            model._materialize_persistent_model()
+
+        model._remove_streaming_hooks.assert_called_once_with()
+        model._install_persistent_runtime_hooks.assert_called_once_with()
+
+    def test_persistent_generate_error_cleans_transient_cuda_cache(self):
+        model = object.__new__(AirLLMBaseModel)
+        model.model = SimpleNamespace(generate=Mock(side_effect=RuntimeError("boom")))
+        model._cancel_prefetch_futures = Mock()
+        model._resident_group_ids = {0, 1}
+        model._unload_group = Mock()
+        model.persistent_gpu_residency = True
+        model._live_stats = SimpleNamespace(start=Mock(), finish=Mock())
+
+        with patch("air_llm.airllm.airllm_base.clean_memory") as clean:
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                model.generate()
+
+        clean.assert_called_once_with()
+        model._unload_group.assert_not_called()
+        model._live_stats.finish.assert_called_once_with()
+
+    def test_close_is_idempotent_for_hook_and_worker_cleanup(self):
+        model = object.__new__(AirLLMBaseModel)
+        streaming_handle = Mock()
+        persistent_handle = Mock()
+        model._streaming_hook_handles = [streaming_handle]
+        model._persistent_model_hook_handles = [persistent_handle]
+        model._prefetch_futures = {}
+        model._gpu_prefetch_futures = {}
+        model._resident_group_ids = set()
+        model.tie_word_embeddings = False
+        model._executor = None
+        model._gpu_prefetch_executor = None
+        model.cpu_layer_cache = SimpleNamespace(close=Mock())
+
+        with patch("air_llm.airllm.airllm_base.clean_memory"):
+            model.close()
+            model.close()
+
+        streaming_handle.remove.assert_called_once_with()
+        persistent_handle.remove.assert_called_once_with()
 
 
 if __name__ == "__main__":
