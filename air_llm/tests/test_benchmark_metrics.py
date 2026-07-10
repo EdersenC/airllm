@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from benchmarks.benchmark_context_limit import resolve_input_tokens
+from benchmarks.benchmark_context_limit import build_natural_prompt_ids, resolve_input_tokens
 from benchmarks.benchmark_group_streaming import (
     collect_environment_metadata,
     count_generated_tokens as benchmark_count_generated_tokens,
@@ -16,6 +16,11 @@ from scripts.run_qwen3_awq import (
 
 
 class TestBenchmarkMetrics(unittest.TestCase):
+    class _CharacterTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            self.last_add_special_tokens = add_special_tokens
+            return [ord(character) for character in text]
+
     class _ChatTokenizer:
         chat_template = "present"
 
@@ -51,6 +56,18 @@ class TestBenchmarkMetrics(unittest.TestCase):
     def test_context_rejects_explicit_total_above_native_limit(self):
         with self.assertRaisesRegex(ValueError, "exceeds native limit"):
             resolve_input_tokens(40960, 40960, 1)
+
+    def test_natural_context_has_exact_size_and_preserves_final_task(self):
+        tokenizer = self._CharacterTokenizer()
+        task = "Build a Python price tracker."
+
+        input_ids = build_natural_prompt_ids(tokenizer, task, input_tokens=512)
+
+        self.assertEqual(tuple(input_ids.shape), (1, 512))
+        decoded_tail = "".join(chr(token_id) for token_id in input_ids[0].tolist())
+        self.assertIn(task, decoded_tail)
+        self.assertTrue(decoded_tail.endswith("Answer with concrete code and concise guidance.\n"))
+        self.assertFalse(tokenizer.last_add_special_tokens)
 
     def test_environment_metadata_records_revision_and_runtime(self):
         metadata = collect_environment_metadata(

@@ -28,6 +28,13 @@ except ImportError:
 
 DEFAULT_MODEL_PATH = Path("/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ")
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "results" / "context-limit.json"
+DEFAULT_CODING_PROMPT = (
+    "Build a complete, production-quality Python command-line price tracker. "
+    "It should fetch product prices asynchronously, validate configuration, store price "
+    "history in SQLite, retry transient failures with exponential backoff, expose useful "
+    "logging, include type hints, and include unit tests. Explain the file layout briefly, "
+    "then provide the implementation."
+)
 
 
 def positive_int(value: str) -> int:
@@ -48,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Synthetic prompt length; default fills native context exactly")
     parser.add_argument("--max-new-tokens", type=positive_int, default=8)
     parser.add_argument("--synthetic-token-id", type=int, default=1000)
+    prompt_source = parser.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompt", default=None,
+                               help="Natural-language task placed at the end of the full context")
+    prompt_source.add_argument("--coding-prompt", action="store_const",
+                               const=DEFAULT_CODING_PROMPT, dest="prompt",
+                               help="Use the prepared production Python price-tracker task")
+    prompt_source.add_argument("--prompt-file", type=Path,
+                               help="UTF-8 natural-language task file")
     parser.add_argument("--layers-per-gpu-group", type=positive_int, default=9)
     parser.add_argument("--max-gpu-layer-fraction", type=float, default=0.5)
     parser.add_argument("--prefetch-groups", type=positive_int, default=8)
@@ -55,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-layer-cache-gib", type=float, default=16.0)
     parser.add_argument("--cpu-layer-cache-policy", choices=("static", "lru"), default="static")
     parser.add_argument("--awq-backend", default="gemm_triton")
+    parser.add_argument(
+        "--cache-implementation",
+        choices=("dynamic", "static", "offloaded", "offloaded_static"),
+        default="dynamic",
+    )
     parser.add_argument("--show-live-stats", action="store_true")
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT_PATH)
     return parser
@@ -73,6 +93,35 @@ def resolve_input_tokens(native_context: int, requested_input: int | None, max_n
             f"requested total context {total_context} exceeds native limit {native_context}"
         )
     return input_tokens
+
+
+def build_natural_prompt_ids(tokenizer, prompt: str, input_tokens: int) -> torch.Tensor:
+    """Fill an exact context while preserving the requested coding task at the end."""
+    prefix = (
+        "You are a senior software engineer. Review the following repeated engineering "
+        "context, then complete the final task.\n\n"
+    )
+    filler = (
+        "Engineering context: prioritize correctness, security, clear interfaces, tests, "
+        "error handling, observability, maintainability, and efficient resource usage.\n"
+    )
+    suffix = f"\nFinal coding task:\n{prompt.strip()}\n\nAnswer with concrete code and concise guidance.\n"
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+    filler_ids = tokenizer.encode(filler, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+    remaining = input_tokens - len(prefix_ids) - len(suffix_ids)
+    if remaining < 0:
+        raise ValueError(
+            f"prompt needs {len(prefix_ids) + len(suffix_ids)} tokens but input budget is "
+            f"{input_tokens}"
+        )
+    repeated_filler = (filler_ids * ((remaining + len(filler_ids) - 1) // len(filler_ids)))[
+        :remaining
+    ] if remaining else []
+    token_ids = prefix_ids + repeated_filler + suffix_ids
+    if len(token_ids) != input_tokens:
+        raise RuntimeError("failed to build the exact requested natural-language context")
+    return torch.tensor([token_ids], dtype=torch.long)
 
 
 def main() -> int:
@@ -118,12 +167,22 @@ def main() -> int:
             f"--synthetic-token-id must be in [0, {vocab_size - 1}]"
         )
 
-    input_ids = torch.full(
-        (1, input_tokens),
-        args.synthetic_token_id,
-        dtype=torch.long,
-        device=args.device,
-    )
+    if args.prompt_file is not None:
+        prompt = args.prompt_file.read_text(encoding="utf-8").strip()
+    else:
+        prompt = args.prompt
+    if prompt is not None:
+        input_ids = build_natural_prompt_ids(
+            model.tokenizer, prompt, input_tokens).to(args.device)
+        prompt_source = "natural"
+    else:
+        input_ids = torch.full(
+            (1, input_tokens),
+            args.synthetic_token_id,
+            dtype=torch.long,
+            device=args.device,
+        )
+        prompt_source = "synthetic"
     attention_mask = torch.ones_like(input_ids)
     streamer = FirstTokenTimer()
     monitor = GPUStatsMonitor(torch.device(args.device).index or 0)
@@ -144,7 +203,7 @@ def main() -> int:
                 min_new_tokens=args.max_new_tokens,
                 do_sample=False,
                 use_cache=True,
-                cache_implementation="dynamic",
+                cache_implementation=args.cache_implementation,
                 disable_compile=True,
                 pad_token_id=model.tokenizer.pad_token_id,
                 streamer=streamer,
@@ -168,6 +227,12 @@ def main() -> int:
         if remaining_seconds > 0:
             post_first_token_tps = (generated_tokens - 1) / remaining_seconds
 
+    generated_text = None
+    if status == "ok" and prompt is not None:
+        generated_text = model.tokenizer.decode(
+            output.sequences[0, input_tokens:], skip_special_tokens=True
+        )
+
     result: dict[str, Any] = {
         "status": status,
         "error": error,
@@ -176,6 +241,9 @@ def main() -> int:
         "input_tokens": input_tokens,
         "requested_new_tokens": args.max_new_tokens,
         "generated_tokens": generated_tokens,
+        "prompt_source": prompt_source,
+        "prompt": prompt,
+        "generated_text": generated_text,
         "total_context": input_tokens + generated_tokens,
         "load_seconds": load_seconds,
         "elapsed_seconds": finished - started,
@@ -191,7 +259,7 @@ def main() -> int:
             "cpu_layer_cache_policy": args.cpu_layer_cache_policy,
             "persistent_gpu_residency": False,
             "awq_backend": args.awq_backend,
-            "cache_implementation": "dynamic",
+            "cache_implementation": args.cache_implementation,
         },
         "environment": collect_environment_metadata(
             torch,
