@@ -80,15 +80,15 @@ Transformers, and GPTQModel versions.
 | Workload | Throughput | Peak allocation |
 | --- | ---: | ---: |
 | Group-24 streaming, batch 1, 64-token dynamic run | 1.60 tok/s | 2,824 MiB |
-| Persistent Marlin, batch 1, warm 64-token runs | 11.12 tok/s | 2,599 MiB |
+| Persistent Marlin, batch 1, warm 64-token runs | 11.59 tok/s | 2,599 MiB |
 | Persistent Marlin, batch 4, warm 64-token runs | 44.68 aggregate tok/s | 2,637 MiB |
 | 40,952-token prefill + 8-token decode | 40,960 total context | 11,415 MiB |
 
-The final max-context run averaged 92.0% GPU utilization and reached 21.25s TTFT.
+The clean-revision max-context run averaged 92.5% GPU utilization and reached 21.61s TTFT.
 It leaves almost no VRAM margin, so keep batch size at 1 near the native 40,960
 token limit. At short context, batch 4 converts spare compute into throughput
 without materially increasing per-sequence latency.
-For the warm 64-token batch-1 comparison, dynamic KV reached 11.12 tok/s versus
+For the warm 64-token batch-1 comparison, dynamic KV reached 11.59 tok/s versus
 10.70 tok/s with static KV, so the prepared launcher intentionally defaults to dynamic.
 
 Reproduce the exact native-context test through the Marlin launcher:
