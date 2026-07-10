@@ -40,7 +40,10 @@ def run_airllm(args):
     from airllm import AutoModel
 
     model = AutoModel.from_pretrained(args.model, compression=args.compression,
-                                      delete_original=args.delete_original)
+                                      delete_original=args.delete_original,
+                                      layers_per_gpu_group=args.layers_per_gpu_group,
+                                      prefetch_groups=args.prefetch_groups,
+                                      prefetching=not args.no_prefetch)
     ids = model.tokenizer([args.prompt], return_tensors="pt",
                           return_attention_mask=False)["input_ids"].cuda()
 
@@ -84,6 +87,12 @@ def main():
     p.add_argument("--compression", default=None, choices=[None, "4bit", "8bit"])
     p.add_argument("--delete-original", action="store_true",
                    help="delete the original checkpoint shards while splitting (saves disk for big models)")
+    p.add_argument("--layers-per-gpu-group", type=int, default=1,
+                   help="Consecutive decoder layers to keep on GPU at once")
+    p.add_argument("--prefetch-groups", type=int, default=1,
+                   help="Upcoming GPU groups to cache in CPU memory")
+    p.add_argument("--no-prefetch", action="store_true",
+                   help="Disable asynchronous group prefetching")
     p.add_argument("--compare", action="store_true",
                    help="also run a full-load reference and assert outputs match")
     args = p.parse_args()

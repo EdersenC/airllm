@@ -2,6 +2,8 @@ import importlib
 from transformers import AutoConfig
 from sys import platform
 
+from .utils import resolve_local_model_path
+
 is_on_mac_os = False
 
 if platform == "darwin":
@@ -33,6 +35,7 @@ class AutoModel:
 
     @classmethod
     def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
+        pretrained_model_name_or_path = resolve_local_model_path(pretrained_model_name_or_path)
         if 'hf_token' in kwargs:
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True,
                                                 token=kwargs['hf_token'])

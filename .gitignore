@@ -1,4 +1,8 @@
 .idea
+.venv
+benchmarks/results/
+benchmarks/*.csv
+benchmarks/*.json
 .ipynb_checkpoints
 .DS_Store
 airllm.egg-info

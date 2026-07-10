@@ -369,6 +369,22 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     return str(saving_path)
 
+def resolve_local_model_path(model_local_path_or_repo_id):
+    """Resolve a local path or Hugging Face cache root to a model directory."""
+    local_model_path = Path(model_local_path_or_repo_id).expanduser()
+    if not local_model_path.exists() or not (local_model_path / 'snapshots').is_dir():
+        return local_model_path
+
+    revision_file = local_model_path / 'refs' / 'main'
+    revision = revision_file.read_text(encoding='utf-8').strip() if revision_file.is_file() else ''
+    snapshot_path = local_model_path / 'snapshots' / revision if revision else None
+    if snapshot_path is not None and snapshot_path.is_dir():
+        return snapshot_path
+
+    snapshots = sorted(p for p in (local_model_path / 'snapshots').iterdir() if p.is_dir())
+    return snapshots[-1] if snapshots else local_model_path
+
+
 def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
                                        layer_names=None, hf_token=None, delete_original=False):
     """
@@ -393,16 +409,29 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
         huggingface api token could be provided, by default None
     """
 
-    # try local model path, if the model exist split and save there
-    if os.path.exists(model_local_path_or_repo_id):
-        if os.path.exists(Path(model_local_path_or_repo_id) / 'pytorch_model.bin.index.json') or \
-           os.path.exists(Path(model_local_path_or_repo_id) / 'model.safetensors.index.json'):
-            print(f"found index file...")
-            return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original)
-        else:
-            print(
-                f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
+    # Try a local model path first. Hugging Face's cache layout points from a
+    # model directory to a revision under ``snapshots/<commit>``; resolve that
+    # indirection so callers can pass either the snapshot or the cache root.
+    local_model_path = resolve_local_model_path(model_local_path_or_repo_id)
+    if local_model_path.exists():
+        has_checkpoint = any(
+            (local_model_path / filename).is_file()
+            for filename in (
+                'pytorch_model.bin.index.json',
+                'model.safetensors.index.json',
+                'pytorch_model.bin',
+                'model.safetensors',
+            )
+        )
+        if has_checkpoint:
+            print(f"found local model at {local_model_path}")
+            return local_model_path, split_and_save_layers(local_model_path, layer_shards_saving_path,
+                                                           compression=compression, layer_names=layer_names,
+                                                           delete_original=delete_original)
+        raise FileNotFoundError(
+            f"Found local directory in {model_local_path_or_repo_id}, but no supported model checkpoint "
+            "was found. Expected model.safetensors, pytorch_model.bin, or an index file."
+        )
 
     # it should be a repo id at this point...
     # First grab everything except the (potentially huge) weight files. For multi-shard models the

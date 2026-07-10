@@ -2,6 +2,7 @@
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,6 +26,55 @@ except ImportError:
     bitsandbytes_installed = False
 
 
+class _LiveStats:
+    """Throttled terminal stats for the active streaming group."""
+
+    def __init__(self, enabled=False, interval=0.25, stream=None):
+        self.enabled = enabled
+        self.interval = max(0.0, float(interval))
+        self.stream = stream or sys.stderr
+        self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.started_at = time.monotonic()
+        self.last_emit_at = 0.0
+        self.last_line_length = 0
+
+    def start(self):
+        self.started_at = time.monotonic()
+        self.last_emit_at = 0.0
+
+    def emit(self, *, forward, batch_size, sequence_length, group_id, group_count,
+              layers, current_layer, phase, prefetch, force=False):
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        if not force and now - self.last_emit_at < self.interval:
+            return
+        if force and not self.interactive and phase == "compute" \
+                and now - self.last_emit_at < self.interval:
+            return
+
+        elapsed = now - self.started_at
+        sequence = sequence_length if sequence_length is not None else "?"
+        line = (
+            f"[AirLLM] forward={forward} batch={batch_size} seq={sequence} "
+            f"phase={phase} group={group_id + 1}/{group_count} "
+            f"layers={layers} current={current_layer} "
+            f"prefetch={prefetch} elapsed={elapsed:.1f}s"
+        )
+        if self.interactive:
+            padding = max(0, self.last_line_length - len(line))
+            print("\r" + line + (" " * padding), end="", file=self.stream, flush=True)
+            self.last_line_length = len(line)
+        else:
+            print(line, file=self.stream, flush=True)
+        self.last_emit_at = now
+
+    def finish(self):
+        if self.enabled and self.interactive:
+            print(file=self.stream, flush=True)
+
+
 class AirLLMBaseModel:
     """
     Memory-frugal wrapper around a Hugging Face ``*ForCausalLM`` model.
@@ -32,8 +82,9 @@ class AirLLMBaseModel:
     The checkpoint is split into per-layer shards on disk. The real transformers model is
     instantiated on the ``meta`` device (no memory used) and owns the full forward / generation
     logic. AirLLM only attaches forward hooks to each big module (embeddings, every decoder
-    layer, the final norm and the lm_head) to stream that module's weights disk -> GPU right
-    before it runs and free them right after, prefetching the next module on a worker thread.
+    layer, the final norm and the lm_head) to stream groups of module weights disk -> GPU right
+    before they run and free the whole group after the last module, prefetching the next group
+    on a worker thread.
 
     Because transformers drives the forward pass, AirLLM no longer needs to track per-architecture
     attention/rotary/cache details: new model architectures work as soon as transformers supports
@@ -49,7 +100,9 @@ class AirLLMBaseModel:
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False,
+                 layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
+                 live_stats_interval=0.25):
         """
         Parameters
         ----------
@@ -72,10 +125,28 @@ class AirLLMBaseModel:
         hf_token: str, optional
             huggingface api token
         prefetching: bool, optional
-            overlap the next layer's disk load with the current layer's compute
+            overlap the next group's disk load with the current group's compute
         delete_original: bool, optional
             delete the original downloaded checkpoint after splitting to save disk space
+        layers_per_gpu_group: int, optional
+            number of consecutive decoder layers to keep resident on the GPU at once. The
+            embedding, final norm, and lm_head are always kept as separate edge groups.
+        prefetch_groups: int, optional
+            number of upcoming GPU groups to load into CPU memory ahead of execution.
+        show_live_stats: bool, optional
+            print throttled group/layer/prefetch progress to stderr during generation.
+        live_stats_interval: float, optional
+            minimum seconds between non-critical live-stat updates.
         """
+
+        if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
+                or layers_per_gpu_group < 1:
+            raise ValueError("layers_per_gpu_group must be a positive integer")
+        if not isinstance(prefetch_groups, int) or isinstance(prefetch_groups, bool) \
+                or prefetch_groups < 1:
+            raise ValueError("prefetch_groups must be a positive integer")
+        if live_stats_interval < 0:
+            raise ValueError("live_stats_interval must be non-negative")
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
@@ -91,6 +162,8 @@ class AirLLMBaseModel:
 
         self.compression = compression
         self.hf_token = hf_token
+        self.layers_per_gpu_group = layers_per_gpu_group
+        self.prefetch_groups = prefetch_groups
 
         self.set_layer_names_dict()
 
@@ -139,8 +212,13 @@ class AirLLMBaseModel:
             print("prefetching is not supported together with compression for now; disabling prefetching.")
             self.prefetching = False
         self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
-        self._prefetch_future = None
-        self._prefetched_idx = None
+        self._prefetch_futures = {}
+        self._resident_group_id = None
+        self._forward_count = 0
+        self._live_batch_size = "?"
+        self._live_sequence_length = "?"
+        self._live_stats = _LiveStats(show_live_stats, live_stats_interval)
+        self._reset_runtime_stats()
 
         self.init_model()
 
@@ -271,7 +349,7 @@ class AirLLMBaseModel:
 
         if self.prefetching and torch.cuda.is_available():
             for k in state_dict.keys():
-                state_dict[k].pin_memory()
+                state_dict[k] = state_dict[k].pin_memory()
 
         return state_dict
 
@@ -290,8 +368,12 @@ class AirLLMBaseModel:
                 # tensors get cast to the runtime dtype.
                 value = state_dict[param_name]
                 if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or param_name.endswith("_scale_inv"):
+                    if value.device.type == "cpu" and value.is_pinned() and self.device.type == "cuda":
+                        value = value.to(self.running_device, non_blocking=True)
                     set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
                 else:
+                    if value.device.type == "cpu" and value.is_pinned() and self.device.type == "cuda":
+                        value = value.to(self.running_device, non_blocking=True)
                     set_module_tensor_to_device(self.model, param_name, self.running_device,
                                                 value=value, dtype=self.running_dtype)
             moved.append(param_name)
@@ -328,16 +410,26 @@ class AirLLMBaseModel:
         # only copy and such models are small) and re-tie lm_head to it, then stream only the
         # decoder layers and the final norm.
         self.tie_word_embeddings = bool(getattr(self.config, "tie_word_embeddings", False))
+        self._resident_embedding_moved = []
 
         if self.tie_word_embeddings:
             embed_state = self.load_layer_to_cpu(self.layer_names[0])
-            self.move_layer_to_device(embed_state)
+            self._resident_embedding_moved = self.move_layer_to_device(embed_state)
             self.model.tie_weights()
-            self._streamed_indices = list(range(1, n - 1))  # decoder layers + final norm
-        else:
-            self._streamed_indices = list(range(n))
+        self._streaming_groups = self._build_streaming_groups(
+            n, self.tie_word_embeddings, self.layers_per_gpu_group)
+        self._streamed_indices = [idx for group in self._streaming_groups for idx in group]
 
         self._streamed_set = set(self._streamed_indices)
+        self._group_by_idx = {
+            idx: group_id
+            for group_id, group in enumerate(self._streaming_groups)
+            for idx in group
+        }
+        self._group_last_idx = {
+            group_id: group[-1]
+            for group_id, group in enumerate(self._streaming_groups)
+        }
 
         for idx in self._streamed_indices:
             module = self.layers[idx]
@@ -345,40 +437,227 @@ class AirLLMBaseModel:
             module.register_forward_pre_hook(self._pre_hook)
             module.register_forward_hook(self._post_hook)
 
-    def _next_streamed_idx(self, idx):
-        nxt = idx + 1
-        return nxt if nxt in self._streamed_set else None
+    @staticmethod
+    def _build_streaming_groups(layer_count, tie_word_embeddings, layers_per_gpu_group):
+        """Build decoder groups while keeping model edges in separate groups."""
+        if layer_count < 3:
+            raise ValueError("AirLLM requires embedding, decoder, and output layers")
+        if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
+                or layers_per_gpu_group < 1:
+            raise ValueError("layers_per_gpu_group must be a positive integer")
+
+        groups = []
+        decoder_indices = list(range(1, layer_count - 2))
+
+        if not tie_word_embeddings:
+            groups.append([0])
+
+        for start in range(0, len(decoder_indices), layers_per_gpu_group):
+            groups.append(decoder_indices[start:start + layers_per_gpu_group])
+
+        # Keep the final norm separate from decoder groups so it does not extend the
+        # residency window unexpectedly. A tied lm_head has no separate shard.
+        groups.append([layer_count - 2])
+        if not tie_word_embeddings:
+            groups.append([layer_count - 1])
+        return groups
+
+    def _load_group_to_cpu(self, group_id):
+        return [
+            self.load_layer_to_cpu(self.layer_names[idx])
+            for idx in self._streaming_groups[group_id]
+        ]
+
+    def _schedule_group_prefetch(self, group_id):
+        if not self.prefetching or group_id is None:
+            return
+        last_group_id = min(
+            len(self._streaming_groups),
+            group_id + 1 + self.prefetch_groups,
+        )
+        for next_group_id in range(group_id + 1, last_group_id):
+            if next_group_id not in self._prefetch_futures:
+                self._prefetch_futures[next_group_id] = self._executor.submit(
+                    self._load_group_to_cpu, next_group_id)
+
+    def _take_group_from_prefetch(self, group_id):
+        if self.prefetching and group_id in self._prefetch_futures:
+            state_dicts = self._prefetch_futures.pop(group_id).result()
+            return state_dicts
+        return self._load_group_to_cpu(group_id)
+
+    def _prefetch_status(self):
+        if not self._prefetch_futures:
+            return "none"
+        return ",".join(
+            f"{group_id + 1}:{'ready' if future.done() else 'loading'}"
+            for group_id, future in sorted(self._prefetch_futures.items())
+        )
+
+    def _emit_live_stats(self, group_id, idx, phase, args=None, force=False):
+        group_layers = self._streaming_groups[group_id]
+        current_position = group_layers.index(idx) + 1
+        self._live_stats.emit(
+            forward=self._forward_count,
+            batch_size=self._live_batch_size,
+            sequence_length=self._live_sequence_length,
+            group_id=group_id,
+            group_count=len(self._streaming_groups),
+            layers=f"{current_position}/{len(group_layers)} "
+                   f"({','.join(str(layer_idx) for layer_idx in group_layers)})",
+            current_layer=self.layer_names[idx],
+            phase=phase,
+            prefetch=self._prefetch_status(),
+            force=force,
+        )
+
+    def _unload_group(self, group_id):
+        for idx in self._streaming_groups[group_id]:
+            module = self.layers[idx]
+            if self.hf_quantizer is not None:
+                for param_name in getattr(module, '_airllm_moved', []):
+                    set_module_tensor_to_device(self.model, param_name, 'meta')
+            else:
+                module.to('meta')
+            module._airllm_moved = []
+        self._resident_group_id = None
+
+    def _load_group_to_device(self, group_id):
+        first_idx = self._streaming_groups[group_id][0]
+        self._emit_live_stats(group_id, first_idx, "loading", force=True)
+        cpu_wait_started = time.perf_counter()
+        state_dicts = self._take_group_from_prefetch(group_id)
+        self._runtime_stats["group_cpu_wait_seconds"] += time.perf_counter() - cpu_wait_started
+        expected_layers = self._streaming_groups[group_id]
+        if len(state_dicts) != len(expected_layers):
+            raise RuntimeError(
+                f"prefetched group {group_id} contained {len(state_dicts)} layers; "
+                f"expected {len(expected_layers)}"
+            )
+        loaded_modules = []
+        gpu_load_started = time.perf_counter()
+        try:
+            for idx, state_dict in zip(expected_layers, state_dicts):
+                module = self.layers[idx]
+                module._airllm_moved = self.move_layer_to_device(state_dict)
+                loaded_modules.append(module)
+        except Exception:
+            # Do not leave a partially loaded group on the GPU if a quantized
+            # parameter fails during materialization.
+            for module in loaded_modules:
+                if self.hf_quantizer is not None:
+                    for param_name in getattr(module, '_airllm_moved', []):
+                        set_module_tensor_to_device(self.model, param_name, 'meta')
+                else:
+                    module.to('meta')
+                module._airllm_moved = []
+            clean_memory()
+            raise
+
+        self._runtime_stats["group_gpu_load_seconds"] += time.perf_counter() - gpu_load_started
+        self._runtime_stats["groups_loaded"] += 1
+        self._resident_group_id = group_id
+        self._schedule_group_prefetch(group_id)
+        self._emit_live_stats(group_id, first_idx, "ready", force=True)
 
     def _pre_hook(self, module, args):
         idx = module._airllm_idx
+        group_id = self._group_by_idx[idx]
 
-        if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == idx:
-            state_dict = self._prefetch_future.result()
-            self._prefetch_future = None
-        else:
-            state_dict = self.load_layer_to_cpu(self.layer_names[idx])
+        if group_id == 0 and idx == self._streaming_groups[group_id][0]:
+            self._forward_count += 1
+            try:
+                shape = args[0].shape
+                self._live_batch_size = int(shape[0])
+                self._live_sequence_length = int(shape[1]) if len(shape) > 1 else "?"
+            except (AttributeError, IndexError, TypeError, ValueError):
+                self._live_batch_size = "?"
+                self._live_sequence_length = "?"
 
-        module._airllm_moved = self.move_layer_to_device(state_dict)
-
-        if self.prefetching:
-            nxt = self._next_streamed_idx(idx)
-            if nxt is not None:
-                self._prefetch_future = self._executor.submit(self.load_layer_to_cpu, self.layer_names[nxt])
-                self._prefetched_idx = nxt
+        if self._resident_group_id != group_id:
+            if self._resident_group_id is not None:
+                self._unload_group(self._resident_group_id)
+            self._load_group_to_device(group_id)
+        if idx == self._streaming_groups[group_id][0]:
+            self._group_compute_started[group_id] = time.perf_counter()
+        self._emit_live_stats(group_id, idx, "compute", args=args)
 
     def _post_hook(self, module, args, output):
-        if self.hf_quantizer is not None:
-            for param_name in getattr(module, '_airllm_moved', []):
-                set_module_tensor_to_device(self.model, param_name, 'meta')
-        else:
-            module.to('meta')
-        clean_memory()
+        idx = module._airllm_idx
+        group_id = self._group_by_idx[idx]
+        if self._group_last_idx[group_id] == idx:
+            compute_started = self._group_compute_started.pop(group_id, None)
+            if compute_started is not None:
+                self._runtime_stats["group_compute_seconds"] += time.perf_counter() - compute_started
+            self._emit_live_stats(group_id, idx, "release", force=True)
+            self._unload_group(group_id)
         return output
 
     # ---- delegation to the underlying transformers model ------------------------------------
 
+    def _reset_runtime_stats(self):
+        self._runtime_stats = {
+            "groups_loaded": 0,
+            "group_cpu_wait_seconds": 0.0,
+            "group_gpu_load_seconds": 0.0,
+            "group_compute_seconds": 0.0,
+        }
+        self._group_compute_started = {}
+
+    def _cancel_prefetch_futures(self):
+        for future in self._prefetch_futures.values():
+            future.cancel()
+        self._prefetch_futures.clear()
+
+    def close(self):
+        """Release resident weights and stop the CPU prefetch worker."""
+        self._cancel_prefetch_futures()
+        if self._resident_group_id is not None:
+            self._unload_group(self._resident_group_id)
+        if getattr(self, "tie_word_embeddings", False):
+            if self.hf_quantizer is not None:
+                for param_name in self._resident_embedding_moved:
+                    set_module_tensor_to_device(self.model, param_name, 'meta')
+            else:
+                self.layers[0].to('meta')
+            self._resident_embedding_moved = []
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        clean_memory()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def get_runtime_stats(self):
+        """Return timing counters for the most recent generation call."""
+        return {
+            **self._runtime_stats,
+            "forward_passes": self._forward_count,
+            "layers_per_gpu_group": self.layers_per_gpu_group,
+            "prefetch_groups": self.prefetch_groups,
+        }
+
     def generate(self, *args, **kwargs):
-        return self.model.generate(*args, **kwargs)
+        self._forward_count = 0
+        self._live_batch_size = "?"
+        self._live_sequence_length = "?"
+        self._reset_runtime_stats()
+        self._live_stats.start()
+        try:
+            return self.model.generate(*args, **kwargs)
+        except BaseException:
+            self._cancel_prefetch_futures()
+            if self._resident_group_id is not None:
+                self._unload_group(self._resident_group_id)
+            clean_memory()
+            raise
+        finally:
+            self._live_stats.finish()
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)

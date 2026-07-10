@@ -79,6 +79,47 @@
 
 ## Quickstart
 
+### Local Qwen3 AWQ test (WSL/Linux)
+
+This checkout includes a ready-to-run smoke test for the local Qwen3 AWQ model. Create an isolated environment and install the checkout:
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e './air_llm[awq]'
+```
+
+Then run the model from the Windows `S:` drive mounted in WSL:
+
+```bash
+.venv/bin/python scripts/run_qwen3_awq.py
+```
+
+The script defaults to `/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ` and automatically resolves its Hugging Face cache snapshot. Pass `--prompt "your prompt"` to try another prompt.
+
+To keep two decoder layers on the GPU at a time, cache the next two decoder layers in CPU memory, and show live layer progress:
+
+```bash
+.venv/bin/python scripts/run_qwen3_awq.py \
+  --layers-per-gpu-group 2 \
+  --prefetch-groups 1 \
+  --max-new-tokens 32
+```
+
+Prompt batching is supported by repeating `--prompt`, loading one prompt per line from `--prompt-file`, and setting `--batch-size`:
+
+```bash
+.venv/bin/python scripts/run_qwen3_awq.py \
+  --prompt "Explain CUDA streams" \
+  --prompt "Explain KV caching" \
+  --batch-size 2 \
+  --layers-per-gpu-group 2 \
+  --prefetch-groups 1
+```
+
+The runner reports batch size, generated tokens, total and per-prompt tokens/sec, elapsed time, peak VRAM, and live group/layer/prefetch state. Use `--no-live-stats` for quiet output.
+
+For repeatable comparisons across group sizes, prefetch depths, and prompt batch sizes, see [benchmarks/README.md](benchmarks/README.md).
+
 ### 1. Install package
 
 First, install the airllm pip package.

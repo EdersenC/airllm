@@ -37,6 +37,11 @@ setuptools.setup(
         'sentencepiece',
         # 'bitsandbytes' is optional (used only for --compression); we fall back gracefully when absent.
     ],
+    extras_require={
+        # Transformers delegates AWQ model replacement to GPTQModel. Its model
+        # registry imports torchvision even for non-vision checkpoints.
+        'awq': ['gptqmodel>=7.1', 'torchvision'],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
