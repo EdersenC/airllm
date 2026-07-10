@@ -38,7 +38,7 @@ the cache root to its current snapshot automatically:
   --group-size 24 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
-  --cache-implementation static \
+  --cache-implementation dynamic \
   --prompt "Explain why layer streaming reduces peak GPU memory." \
   --prompt-repeats 4 \
   --prompt-batch-size 2 \

@@ -129,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-implementation",
         choices=("dynamic", "static", "offloaded", "offloaded_static"),
-        default="static",
+        default="dynamic",
         help="Transformers KV-cache implementation used during generation.",
     )
 
@@ -429,8 +429,8 @@ def generate_once(
         "do_sample": False,
         "use_cache": True,
         "cache_implementation": cache_implementation,
-        # Group hooks materialize different parameters every forward. Keep the
-        # realistic static cache, but do not let Transformers torch.compile it.
+        # Group hooks materialize different parameters every forward. Static
+        # cache may auto-compile, so disable compilation for every comparable run.
         "disable_compile": True,
         "return_dict_in_generate": True,
         "streamer": streamer,

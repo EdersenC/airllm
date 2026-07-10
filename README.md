@@ -98,14 +98,14 @@ The script defaults to `/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-A
 
 For the tested 12 GB RTX 5070 setup, keep 24 decoder layers resident, retain the
 complete Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next
-group on a dedicated CUDA stream, and use a realistic static KV cache:
+group on a dedicated CUDA stream, and use a realistic dynamic KV cache:
 
 ```bash
 .venv/bin/python scripts/run_qwen3_awq.py \
   --layers-per-gpu-group 24 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
-  --cache-implementation static \
+  --cache-implementation dynamic \
   --max-new-tokens 64
 ```
 
@@ -119,7 +119,7 @@ Prompt batching is supported by repeating `--prompt`, loading one prompt per lin
   --layers-per-gpu-group 24 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
-  --cache-implementation static
+  --cache-implementation dynamic
 ```
 
 The runner reports batch size, generated tokens, total and per-prompt tokens/sec,

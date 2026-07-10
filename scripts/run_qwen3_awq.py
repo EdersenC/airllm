@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument(
         "--cache-implementation",
         choices=("dynamic", "static", "offloaded", "offloaded_static"),
-        default="static",
+        default="dynamic",
         help="Transformers KV-cache implementation",
     )
     parser.add_argument("--no-live-stats", action="store_true",
@@ -88,8 +88,8 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         do_sample=False,
         use_cache=True,
         cache_implementation=args.cache_implementation,
-        # AirLLM swaps meta/GPU weights from Python hooks every forward, which
-        # cannot be captured safely by Transformers' static-cache auto-compile.
+        # AirLLM swaps meta/GPU weights from Python hooks every forward. Static
+        # cache may auto-compile, which cannot capture those mutations safely.
         disable_compile=True,
         return_dict_in_generate=True,
     )

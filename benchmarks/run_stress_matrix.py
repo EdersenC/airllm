@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -49,6 +50,7 @@ OVERNIGHT_CASES = (
     Case("group24-static", group=24, batch=1, tokens=64),
     Case("group24-static-batch2", group=24, batch=2, tokens=64),
     Case("group24-static-batch4", group=24, batch=4, tokens=64),
+    Case("group24-dynamic-batch4", group=24, batch=4, tokens=64, cache="dynamic"),
     Case("group24-offloaded-kv", group=24, batch=2, tokens=64, cache="offloaded"),
 )
 
@@ -208,6 +210,12 @@ def write_report(output_dir: Path, results: list[dict[str, Any]], args: argparse
         lines.extend([
             f"Best throughput: **{metric['tokens_per_sec']:.2f} tok/s** with `{best['name']}` "
             f"at {metric['gpu_util_avg_pct']:.1f}% average GPU utilization.",
+            "",
+            "Best command:",
+            "",
+            "```bash",
+            shlex.join(best["command"]),
+            "```",
             "",
         ])
     lines.extend([
