@@ -35,9 +35,24 @@ class CPULayerCacheTests(unittest.TestCase):
         self.assertEqual(
             cache.stats(),
             cache.stats().__class__(
-                hits=3, misses=1, evictions=1, bytes=16, max_bytes=16, entries=2
+                hits=3, misses=1, evictions=1, admission_rejections=0,
+                bytes=16, max_bytes=16, entries=2
             ),
         )
+
+    def test_static_admission_keeps_a_hot_set_during_cyclic_scans(self) -> None:
+        cache = CPULayerCache(max_bytes=16, admission_policy="static")
+        first, second, overflow = state_dict(2), state_dict(2), state_dict(2)
+
+        self.assertTrue(cache.put("first", first))
+        self.assertTrue(cache.put("second", second))
+        self.assertFalse(cache.put("overflow", overflow))
+
+        self.assertIs(cache.get("first")["weight"], first["weight"])
+        self.assertIs(cache.get("second")["weight"], second["weight"])
+        self.assertIsNone(cache.get("overflow"))
+        stats = cache.stats()
+        self.assertEqual((stats.evictions, stats.admission_rejections), (0, 1))
 
     def test_oversized_entry_does_not_flush_hot_entries(self) -> None:
         cache = CPULayerCache(max_bytes=8)
@@ -86,6 +101,8 @@ class CPULayerCacheTests(unittest.TestCase):
             CPULayerCache(max_gib=float("inf"))
         with self.assertRaises(TypeError):
             CPULayerCache(max_bytes=1.5)
+        with self.assertRaises(ValueError):
+            CPULayerCache(max_bytes=8, admission_policy="clock")
 
         cache = CPULayerCache(max_bytes=8)
         with self.assertRaises(TypeError):

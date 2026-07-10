@@ -27,31 +27,31 @@ class Case:
     group: int
     batch: int
     tokens: int
-    cache: str = "static"
-    cpu_cache_gib: float = 4.0
-    prefetch_groups: int = 2
+    cache: str = "dynamic"
+    cpu_cache_gib: float = 16.0
+    prefetch_groups: int = 8
     copy_stream: bool = True
 
 
 QUICK_CASES = (
-    Case("group8-static", group=8, batch=1, tokens=16),
-    Case("group24-static", group=24, batch=1, tokens=32),
-    Case("group24-batch2", group=24, batch=2, tokens=32),
+    Case("group9-batch1", group=9, batch=1, tokens=32),
+    Case("group9-batch8", group=9, batch=8, tokens=32),
+    Case("group18-no-copy", group=18, batch=1, tokens=32, copy_stream=False),
 )
 
 OVERNIGHT_CASES = (
     Case("baseline-group2-no-cache", group=2, batch=1, tokens=16,
          cache="dynamic", cpu_cache_gib=0.0, copy_stream=False),
-    Case("group2-static", group=2, batch=1, tokens=64),
-    Case("group8-static", group=8, batch=1, tokens=64),
-    Case("group16-static", group=16, batch=1, tokens=64),
-    Case("group24-dynamic", group=24, batch=1, tokens=64, cache="dynamic"),
-    Case("group24-static-copy-off", group=24, batch=1, tokens=64, copy_stream=False),
-    Case("group24-static", group=24, batch=1, tokens=64),
-    Case("group24-static-batch2", group=24, batch=2, tokens=64),
-    Case("group24-static-batch4", group=24, batch=4, tokens=64),
-    Case("group24-dynamic-batch4", group=24, batch=4, tokens=64, cache="dynamic"),
-    Case("group24-offloaded-kv", group=24, batch=2, tokens=64, cache="offloaded"),
+    Case("group4-batch1", group=4, batch=1, tokens=64),
+    Case("group6-batch1", group=6, batch=1, tokens=64),
+    Case("group8-batch1", group=8, batch=1, tokens=64),
+    Case("group9-batch1", group=9, batch=1, tokens=128),
+    Case("group18-no-copy", group=18, batch=1, tokens=64, copy_stream=False),
+    Case("group9-batch4", group=9, batch=4, tokens=64),
+    Case("group9-batch8", group=9, batch=8, tokens=64),
+    Case("group9-batch16", group=9, batch=16, tokens=64),
+    Case("group9-batch32", group=9, batch=32, tokens=64),
+    Case("group9-offloaded-kv", group=9, batch=2, tokens=64, cache="offloaded"),
 )
 
 
@@ -124,11 +124,17 @@ def run_case(case: Case, args: argparse.Namespace, output_dir: Path) -> dict[str
         "--model-path", str(args.model_path),
         "--device", "cuda:0",
         "--group-size", str(case.group),
+        "--max-gpu-layer-fraction", "0.5",
         "--prefetch-groups", str(case.prefetch_groups),
+        "--cpu-prefetch-workers", "2",
         "--cpu-layer-cache-gib", str(case.cpu_cache_gib),
+        "--cpu-layer-cache-policy", "static",
+        "--awq-backend", "gemm_triton",
         "--cache-implementation", case.cache,
+        "--prompt-repeats", str(case.batch),
         "--prompt-batch-size", str(case.batch),
         "--max-new-tokens", str(case.tokens),
+        "--min-new-tokens", str(case.tokens),
         "--warmup", "0",
         "--repeats", "1",
         "--output-csv", str(csv_path),

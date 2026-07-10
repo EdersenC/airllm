@@ -3,22 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from torch import nn
 
 from ..airllm.airllm_base import AirLLMBaseModel
 
 
 class TestGroupStreaming(unittest.TestCase):
-    class _IndexedModule(nn.Module):
-        def __init__(self, layer_idx):
-            super().__init__()
-            self.layer_idx = layer_idx
-
-    class _DecoderLayer(nn.Module):
-        def __init__(self, layer_idx):
-            super().__init__()
-            self.self_attn = TestGroupStreaming._IndexedModule(layer_idx)
-
     class _Executor:
         def __init__(self):
             self.submitted = []
@@ -59,6 +48,22 @@ class TestGroupStreaming(unittest.TestCase):
         model._schedule_group_prefetch(0)
 
         self.assertEqual(model._executor.submitted, [1, 2])
+
+    def test_prefetch_window_respects_bounded_cpu_memory_budget(self):
+        model = object.__new__(AirLLMBaseModel)
+        model.prefetching = True
+        model.prefetch_groups = 3
+        model.cpu_prefetch_budget_bytes = 15
+        model._streaming_groups = [[0], [1], [2], [3]]
+        model._prefetch_futures = {}
+        model._gpu_prefetch_futures = {}
+        model._group_cpu_sources = {}
+        model._executor = self._Executor()
+        model._estimated_group_shard_bytes = Mock(return_value=10)
+
+        model._schedule_group_prefetch(0)
+
+        self.assertEqual(model._executor.submitted, [1])
 
     def test_cuda_prefetch_promotes_immediate_cpu_future(self):
         model = object.__new__(AirLLMBaseModel)
@@ -120,98 +125,48 @@ class TestGroupStreaming(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     AirLLMBaseModel._build_streaming_groups(6, True, group_size)
 
-    def test_even_layer_selection_matches_half_and_third_qwen_stack(self):
+    def test_cuda_double_buffer_counts_current_and_next_decoder_groups(self):
+        groups = AirLLMBaseModel._build_streaming_groups(
+            layer_count=39,
+            tie_word_embeddings=True,
+            layers_per_gpu_group=9,
+        )
+
+        peak = AirLLMBaseModel._peak_decoder_layer_residency(
+            groups,
+            decoder_layer_count=36,
+            cuda_copy_stream=True,
+            persistent_gpu_residency=False,
+        )
+
+        self.assertEqual(peak, 18)
+
+    def test_synchronous_copy_counts_only_the_active_decoder_group(self):
+        groups = AirLLMBaseModel._build_streaming_groups(
+            layer_count=39,
+            tie_word_embeddings=True,
+            layers_per_gpu_group=18,
+        )
+
+        peak = AirLLMBaseModel._peak_decoder_layer_residency(
+            groups,
+            decoder_layer_count=36,
+            cuda_copy_stream=False,
+            persistent_gpu_residency=False,
+        )
+
+        self.assertEqual(peak, 18)
+
+    def test_persistent_residency_counts_the_complete_decoder_stack(self):
         self.assertEqual(
-            AirLLMBaseModel._select_evenly_spaced_layers(36, 18),
-            [0, 2, 4, 6, 8, 10, 12, 14, 16, 19, 21, 23, 25, 27, 29, 31, 33, 35],
+            AirLLMBaseModel._peak_decoder_layer_residency(
+                groups=[[1, 2], [3, 4]],
+                decoder_layer_count=36,
+                cuda_copy_stream=True,
+                persistent_gpu_residency=True,
+            ),
+            36,
         )
-        self.assertEqual(
-            AirLLMBaseModel._select_evenly_spaced_layers(36, 12),
-            [0, 3, 6, 10, 13, 16, 19, 22, 25, 29, 32, 35],
-        )
-
-    def test_even_layer_selection_rejects_impossible_count(self):
-        with self.assertRaisesRegex(ValueError, "exceeds the checkpoint"):
-            AirLLMBaseModel._select_evenly_spaced_layers(12, 13)
-
-    def test_reduced_depth_compacts_layers_and_cache_indices(self):
-        model = object.__new__(AirLLMBaseModel)
-        decoder_layers = nn.ModuleList([self._DecoderLayer(index) for index in range(6)])
-        base_model = SimpleNamespace(layers=decoder_layers, has_sliding_layers=True)
-        config = SimpleNamespace(
-            num_hidden_layers=6,
-            layer_types=[
-                "full_attention",
-                "sliding_attention",
-                "full_attention",
-                "sliding_attention",
-                "full_attention",
-                "sliding_attention",
-            ],
-        )
-        model.model = SimpleNamespace(model=base_model, config=config)
-        model.config = config
-        model.layer_names_dict = {"layer_prefix": "model.layers"}
-        model.requested_decoder_layer_count = 3
-        model.requested_decoder_layer_indices = None
-
-        model._configure_decoder_layer_selection()
-
-        self.assertEqual(model.original_decoder_layer_count, 6)
-        self.assertEqual(model.decoder_layer_indices, [0, 3, 5])
-        self.assertEqual(config.num_hidden_layers, 3)
-        self.assertEqual(
-            config.layer_types,
-            ["full_attention", "sliding_attention", "sliding_attention"],
-        )
-        self.assertEqual(
-            [layer.self_attn.layer_idx for layer in base_model.layers],
-            [0, 1, 2],
-        )
-        self.assertTrue(base_model.has_sliding_layers)
-
-    def test_explicit_layer_selection_preserves_profile_order_and_renumbers_cache(self):
-        model = object.__new__(AirLLMBaseModel)
-        decoder_layers = nn.ModuleList([self._DecoderLayer(index) for index in range(6)])
-        base_model = SimpleNamespace(layers=decoder_layers)
-        config = SimpleNamespace(num_hidden_layers=6, layer_types=None)
-        model.model = SimpleNamespace(model=base_model, config=config)
-        model.config = config
-        model.layer_names_dict = {"layer_prefix": "model.layers"}
-        model.requested_decoder_layer_count = 3
-        model.requested_decoder_layer_indices = [0, 4, 5]
-
-        model._configure_decoder_layer_selection()
-
-        self.assertEqual(model.decoder_layer_indices, [0, 4, 5])
-        self.assertEqual(model.decoder_layer_selection, "explicit")
-        self.assertEqual(
-            [layer.self_attn.layer_idx for layer in base_model.layers],
-            [0, 1, 2],
-        )
-
-    def test_reduced_depth_remaps_original_shard_to_runtime_layer(self):
-        model = object.__new__(AirLLMBaseModel)
-        model.layer_names = ["model.embed_tokens", "model.layers.0", "model.layers.35"]
-        model.runtime_layer_names = ["model.embed_tokens", "model.layers.0", "model.layers.1"]
-        tensor = torch.ones(1)
-
-        remapped = model._remap_layer_state_dict(
-            2,
-            {
-                "model.layers.35.self_attn.q_proj.qweight": tensor,
-                "model.layers.35.input_layernorm.weight": tensor,
-            },
-        )
-
-        self.assertEqual(
-            set(remapped),
-            {
-                "model.layers.1.self_attn.q_proj.qweight",
-                "model.layers.1.input_layernorm.weight",
-            },
-        )
-        self.assertIs(remapped["model.layers.1.input_layernorm.weight"], tensor)
 
     def test_awq_backend_override_is_copied_into_model_config(self):
         model = object.__new__(AirLLMBaseModel)

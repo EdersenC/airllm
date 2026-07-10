@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${AIRLLM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 PYTHON_BIN_DIR="$(dirname -- "${PYTHON}")"
-LAYER_PROFILE="${ROOT_DIR}/benchmarks/profiles/qwen3-4b-awq-block-influence.json"
-GPU_LAYER_GROUP_SIZE="${AIRLLM_GPU_LAYER_GROUP_SIZE:-12}"
+GPU_LAYER_GROUP_SIZE="${AIRLLM_GPU_LAYER_GROUP_SIZE:-9}"
 
 if [[ ! -x "${PYTHON}" ]]; then
     echo "AirLLM Python environment not found: ${PYTHON}" >&2
@@ -66,15 +65,12 @@ if [[ "${1:-}" == "--context-limit-benchmark" ]]; then
     shift
     exec "${PYTHON}" "${ROOT_DIR}/benchmarks/benchmark_context_limit.py" \
         --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
+        --max-gpu-layer-fraction 0.5 \
         --prefetch-groups 8 \
+        --cpu-prefetch-workers 2 \
         --cpu-layer-cache-gib 16 \
-        --awq-backend marlin \
+        --awq-backend gemm_triton \
         "$@"
-fi
-
-if [[ "${1:-}" == "--calibrate-layer-profile" ]]; then
-    shift
-    exec "${PYTHON}" "${ROOT_DIR}/benchmarks/calibrate_block_influence.py" "$@"
 fi
 
 if [[ "${1:-}" == "--benchmark" ]]; then
@@ -83,41 +79,37 @@ if [[ "${1:-}" == "--benchmark" ]]; then
         --model-path /mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ \
         --device cuda:0 \
         --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
+        --max-gpu-layer-fraction 0.5 \
         --prefetch-groups 8 \
+        --cpu-prefetch-workers 2 \
         --cpu-layer-cache-gib 16 \
+        --cpu-layer-cache-policy static \
         --no-persistent-gpu-residency \
-        --awq-backend auto \
+        --awq-backend gemm_triton \
         --cache-implementation dynamic \
-        --decoder-layer-profile "${LAYER_PROFILE}" \
         "$@"
 fi
 
-if [[ "${1:-}" == "--quality-reduced" ]]; then
-    echo "--quality-reduced was removed from the normal launcher because it skips trained model layers." >&2
-    echo "Use --layers-per-gpu-group ${GPU_LAYER_GROUP_SIZE} to limit simultaneous GPU residency while still executing every layer." >&2
-    exit 2
-fi
-
-USE_PERSISTENT_RESIDENCY=false
 for argument in "$@"; do
     case "${argument}" in
-        --persistent-gpu-residency) USE_PERSISTENT_RESIDENCY=true ;;
-        --no-persistent-gpu-residency) USE_PERSISTENT_RESIDENCY=false ;;
+        --persistent-gpu-residency)
+            echo "The prepared streaming launcher enforces half-or-less decoder-weight residency." >&2
+            echo "Full-model GPU residency is outside this fork's large-model benchmark target." >&2
+            exit 2
+            ;;
     esac
 done
-if [[ "${USE_PERSISTENT_RESIDENCY}" == true ]]; then
-    RESIDENCY_ARGS=(--persistent-gpu-residency --awq-backend marlin)
-else
-    RESIDENCY_ARGS=(--no-persistent-gpu-residency --awq-backend auto)
-fi
 
 exec "${PYTHON}" "${ROOT_DIR}/scripts/run_qwen3_awq.py" \
     --layers-per-gpu-group "${GPU_LAYER_GROUP_SIZE}" \
+    --max-gpu-layer-fraction 0.5 \
     --prefetch-groups 8 \
+    --cpu-prefetch-workers 2 \
     --cpu-layer-cache-gib 16 \
-    "${RESIDENCY_ARGS[@]}" \
+    --cpu-layer-cache-policy static \
+    --no-persistent-gpu-residency \
+    --awq-backend gemm_triton \
     --cache-implementation dynamic \
-    --decoder-layer-profile "${LAYER_PROFILE}" \
-    --max-input-tokens 40704 \
-    --max-new-tokens 256 \
+    --max-input-tokens 40448 \
+    --max-new-tokens 512 \
     "$@"

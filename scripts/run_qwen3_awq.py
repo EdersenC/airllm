@@ -8,39 +8,20 @@ from pathlib import Path
 import torch
 
 from airllm import AutoModel
-try:
-    from scripts.layer_profiles import (
-        LayerProfileError,
-        load_layer_profile,
-        parse_layer_indices,
-        select_profile_layers,
-        validate_profile_identity,
-    )
-except ModuleNotFoundError:
-    from layer_profiles import (
-        LayerProfileError,
-        load_layer_profile,
-        parse_layer_indices,
-        select_profile_layers,
-        validate_profile_identity,
-    )
 
 
 DEFAULT_MODEL_CACHE = Path("/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ")
 DEFAULT_PROMPT = "What is the capital of France?"
-DEFAULT_LAYER_PROFILE = (
-    Path(__file__).resolve().parents[1]
-    / "benchmarks"
-    / "profiles"
-    / "qwen3-4b-awq-block-influence.json"
-)
 
 
-def layer_indices_arg(value):
+def layer_fraction_arg(value):
     try:
-        return parse_layer_indices(value)
-    except LayerProfileError as exc:
+        fraction = float(value)
+    except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 < fraction <= 1:
+        raise argparse.ArgumentTypeError("must be greater than 0 and at most 1")
+    return fraction
 
 
 def parse_args():
@@ -60,18 +41,16 @@ def parse_args():
                         help="Tokenizer truncation limit for each prompt")
     parser.add_argument("--layers-per-gpu-group", type=int, default=1,
                         help="Consecutive decoder layers resident on GPU at once; every model layer still executes")
-    parser.add_argument("--decoder-layer-count", type=int, default=None,
-                        help="Experimental model-depth pruning; skips trained blocks and is unrelated to GPU group size")
-    parser.add_argument("--decoder-layer-indices", type=layer_indices_arg, default=None,
-                        help="Explicit comma-separated source-layer indices to retain")
-    parser.add_argument("--decoder-layer-profile", type=Path, default=DEFAULT_LAYER_PROFILE,
-                        help="Block Influence profile used to rank layers and enforce its quality floor")
-    parser.add_argument("--allow-unsafe-layer-drop", action="store_true",
-                        help="Bypass the profile quality floor for speed-only broken-output experiments")
+    parser.add_argument("--max-gpu-layer-fraction", type=layer_fraction_arg, default=0.5,
+                        help="Maximum decoder-weight fraction on GPU, including CUDA-prefetched layers")
     parser.add_argument("--prefetch-groups", type=int, default=1,
                         help="Upcoming GPU groups to cache in CPU memory")
+    parser.add_argument("--cpu-prefetch-workers", type=int, default=2,
+                        help="Concurrent CPU shard-loading workers")
     parser.add_argument("--cpu-layer-cache-gib", type=float, default=4.0,
                         help="Bounded pinned-RAM cache for layer shards")
+    parser.add_argument("--cpu-layer-cache-policy", choices=("static", "lru"),
+                        default="static", help="Static hot-set retention or ordinary LRU")
     parser.add_argument("--persistent-gpu-residency", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Preload and retain the complete model when it fits in VRAM")
@@ -140,39 +119,6 @@ def format_prompts(tokenizer, prompts, prompt_format="auto", enable_thinking=Fal
             )
         formatted.append(text)
     return formatted, "chat"
-
-
-def resolve_decoder_layer_selection(args):
-    """Resolve an explicit/profile-ranked stack and fail closed below measured quality."""
-    if args.decoder_layer_count is None and args.decoder_layer_indices is None:
-        return None, None
-
-    selected_count = args.decoder_layer_count
-    if args.decoder_layer_indices is not None:
-        if selected_count is None:
-            selected_count = len(args.decoder_layer_indices)
-            args.decoder_layer_count = selected_count
-        elif selected_count != len(args.decoder_layer_indices):
-            raise LayerProfileError(
-                "--decoder-layer-count must match --decoder-layer-indices length"
-            )
-
-    profile = load_layer_profile(args.decoder_layer_profile) \
-        if args.decoder_layer_profile is not None else None
-    if profile is not None:
-        profile_indices = select_profile_layers(
-            profile,
-            selected_count,
-            allow_unsafe=args.allow_unsafe_layer_drop,
-        )
-        if args.decoder_layer_indices is None:
-            return profile_indices, profile
-        if args.decoder_layer_indices != profile_indices and not args.allow_unsafe_layer_drop:
-            raise LayerProfileError(
-                "explicit layer indices differ from the calibrated profile; use "
-                "--allow-unsafe-layer-drop to run an unvalidated selection"
-            )
-    return args.decoder_layer_indices, profile
 
 
 class FirstTokenTimer:
@@ -285,6 +231,7 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         f"cpu_wait_seconds={runtime_stats['group_cpu_wait_seconds']:.2f} "
         f"gpu_load_seconds={runtime_stats['group_gpu_load_seconds']:.2f} "
         f"copy_wait_seconds={runtime_stats['group_copy_wait_seconds']:.2f} "
+        f"copy_stream_dependencies={runtime_stats['copy_stream_dependencies']} "
         f"group_compute_seconds={runtime_stats['group_compute_seconds']:.2f}"
         f" cuda_prefetched_groups={runtime_stats['cuda_prefetched_groups']} "
         f"resident_group_hits={runtime_stats['resident_group_hits']} "
@@ -292,6 +239,8 @@ def run_batch(model, prompts, args, batch_number, prompt_offset):
         f"awq_backend={runtime_stats['awq_backend']} "
         f"quantized_kernel={runtime_stats['quantized_kernel']} "
         f"cpu_cache_hits={runtime_stats['cpu_cache_hits']} "
+        f"cpu_cache_admission_rejections="
+        f"{runtime_stats['cpu_cache_admission_rejections']} "
         f"cpu_cache_gib={runtime_stats['cpu_cache_bytes'] / (1024 ** 3):.2f}"
         + (f" peak_vram_mb={peak_vram_mb:.0f}" if peak_vram_mb is not None else "")
     )
@@ -327,12 +276,6 @@ def main():
         raise SystemExit("--max-new-tokens must be positive")
     if args.min_new_tokens < 0 or args.min_new_tokens > args.max_new_tokens:
         raise SystemExit("--min-new-tokens must be between zero and --max-new-tokens")
-    if args.decoder_layer_count is not None and args.decoder_layer_count < 1:
-        raise SystemExit("--decoder-layer-count must be positive")
-    try:
-        decoder_layer_indices, layer_profile = resolve_decoder_layer_selection(args)
-    except LayerProfileError as exc:
-        raise SystemExit(str(exc)) from exc
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     prompts = load_prompts(args)
@@ -340,15 +283,13 @@ def main():
     print(f"model: {args.model_cache}")
     print(f"device: {device}")
     print(f"gpu_resident_decoder_layers_per_group: {args.layers_per_gpu_group}")
-    print(f"requested_model_decoder_layers: {args.decoder_layer_count or 'all'}")
-    print(
-        "decoder_layer_profile: "
-        f"{layer_profile['profile_path'] if layer_profile is not None else 'none'}"
-    )
-    print(f"allow_unsafe_layer_drop: {args.allow_unsafe_layer_drop}")
+    print("model_decoder_layers: all checkpoint layers (never pruned)")
+    print(f"max_gpu_layer_fraction: {args.max_gpu_layer_fraction}")
     print(f"prefetch_groups: {args.prefetch_groups}")
+    print(f"cpu_prefetch_workers: {args.cpu_prefetch_workers}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
     print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
+    print(f"cpu_layer_cache_policy: {args.cpu_layer_cache_policy}")
     print(f"persistent_gpu_residency: {args.persistent_gpu_residency}")
     print(f"awq_backend: {args.awq_backend or 'checkpoint default'}")
     print(f"kv_cache: {args.cache_implementation}")
@@ -360,11 +301,12 @@ def main():
         str(args.model_cache),
         device=device,
         layers_per_gpu_group=args.layers_per_gpu_group,
-        decoder_layer_count=args.decoder_layer_count,
-        decoder_layer_indices=decoder_layer_indices,
+        max_gpu_layer_fraction=args.max_gpu_layer_fraction,
         prefetch_groups=args.prefetch_groups,
+        cpu_prefetch_workers=args.cpu_prefetch_workers,
         cuda_copy_stream=not args.no_cuda_copy_stream,
         cpu_layer_cache_gib=args.cpu_layer_cache_gib,
+        cpu_layer_cache_policy=args.cpu_layer_cache_policy,
         persistent_gpu_residency=args.persistent_gpu_residency,
         awq_backend=args.awq_backend,
         show_live_stats=not args.no_live_stats,
@@ -372,20 +314,16 @@ def main():
         layer_shards_saving_path=str(args.layer_shards_path) if args.layer_shards_path else None,
     )
     runtime_stats = model.get_runtime_stats()
-    if layer_profile is not None:
-        try:
-            validate_profile_identity(
-                layer_profile,
-                original_decoder_layer_count=runtime_stats["original_decoder_layer_count"],
-                resolved_model_path=model.model_local_path,
-            )
-        except LayerProfileError as exc:
-            model.close()
-            raise SystemExit(str(exc)) from exc
     print(
         "model_decoder_layers_executed: "
-        f"{runtime_stats['decoder_layer_count']}/{runtime_stats['original_decoder_layer_count']} "
-        f"source_indices={runtime_stats['decoder_layer_indices']}"
+        f"{runtime_stats['decoder_layer_count']}/"
+        f"{runtime_stats['original_decoder_layer_count']} (100%)"
+    )
+    print(
+        "configured_peak_gpu_decoder_layers: "
+        f"{runtime_stats['configured_peak_gpu_decoder_layers']}/"
+        f"{runtime_stats['decoder_layer_count']} "
+        f"(limit {runtime_stats['max_gpu_resident_decoder_layers']})"
     )
     results = []
     try:

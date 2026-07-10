@@ -48,11 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Synthetic prompt length; default fills native context exactly")
     parser.add_argument("--max-new-tokens", type=positive_int, default=8)
     parser.add_argument("--synthetic-token-id", type=int, default=1000)
-    parser.add_argument("--layers-per-gpu-group", type=positive_int, default=24)
+    parser.add_argument("--layers-per-gpu-group", type=positive_int, default=9)
+    parser.add_argument("--max-gpu-layer-fraction", type=float, default=0.5)
     parser.add_argument("--prefetch-groups", type=positive_int, default=8)
+    parser.add_argument("--cpu-prefetch-workers", type=positive_int, default=2)
     parser.add_argument("--cpu-layer-cache-gib", type=float, default=16.0)
-    parser.add_argument("--awq-backend", default="marlin")
-    parser.add_argument("--no-persistent-gpu-residency", action="store_true")
+    parser.add_argument("--cpu-layer-cache-policy", choices=("static", "lru"), default="static")
+    parser.add_argument("--awq-backend", default="gemm_triton")
     parser.add_argument("--show-live-stats", action="store_true")
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT_PATH)
     return parser
@@ -79,17 +81,20 @@ def main() -> int:
         raise SystemExit("CUDA is required for the context-limit benchmark")
     if args.cpu_layer_cache_gib < 0:
         raise SystemExit("--cpu-layer-cache-gib must be non-negative")
-    if args.no_persistent_gpu_residency and args.awq_backend == "marlin":
-        raise SystemExit("Marlin requires persistent GPU residency")
+    if not 0 < args.max_gpu_layer_fraction <= 1:
+        raise SystemExit("--max-gpu-layer-fraction must be greater than 0 and at most 1")
 
     load_started = time.perf_counter()
     model = AutoModel.from_pretrained(
         str(args.model_path.expanduser()),
         device=args.device,
         layers_per_gpu_group=args.layers_per_gpu_group,
+        max_gpu_layer_fraction=args.max_gpu_layer_fraction,
         prefetch_groups=args.prefetch_groups,
+        cpu_prefetch_workers=args.cpu_prefetch_workers,
         cpu_layer_cache_gib=args.cpu_layer_cache_gib,
-        persistent_gpu_residency=not args.no_persistent_gpu_residency,
+        cpu_layer_cache_policy=args.cpu_layer_cache_policy,
+        persistent_gpu_residency=False,
         awq_backend=args.awq_backend,
         show_live_stats=args.show_live_stats,
     )
@@ -179,9 +184,12 @@ def main() -> int:
         "peak_vram_mib": torch.cuda.max_memory_allocated(args.device) / (1024 ** 2),
         "configuration": {
             "layers_per_gpu_group": args.layers_per_gpu_group,
+            "max_gpu_layer_fraction": args.max_gpu_layer_fraction,
             "prefetch_groups": args.prefetch_groups,
+            "cpu_prefetch_workers": args.cpu_prefetch_workers,
             "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
-            "persistent_gpu_residency": not args.no_persistent_gpu_residency,
+            "cpu_layer_cache_policy": args.cpu_layer_cache_policy,
+            "persistent_gpu_residency": False,
             "awq_backend": args.awq_backend,
             "cache_implementation": "dynamic",
         },

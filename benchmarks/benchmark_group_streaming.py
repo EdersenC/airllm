@@ -25,15 +25,6 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.layer_profiles import (  # noqa: E402 - keep dry-run independent of AirLLM imports
-    LayerProfileError,
-    load_layer_profile,
-    parse_layer_indices,
-    select_profile_layers,
-    validate_profile_identity,
-)
-
-
 DEFAULT_MODEL_PATH = Path("/mnt/s/ai-cache/huggingface/hub/models--Qwen--Qwen3-4B-AWQ")
 DEFAULT_PROMPT = "Explain why layer streaming can reduce peak GPU memory usage in one paragraph."
 DEFAULT_CSV_PATH = Path("benchmarks/results.csv")
@@ -60,6 +51,7 @@ CSV_FIELDS = (
     "group_cpu_wait_seconds",
     "group_gpu_load_seconds",
     "group_copy_wait_seconds",
+    "copy_stream_dependencies",
     "group_compute_seconds",
     "cuda_prefetched_groups",
     "resident_group_hits",
@@ -68,6 +60,7 @@ CSV_FIELDS = (
     "cpu_cache_hits",
     "cpu_cache_misses",
     "cpu_cache_evictions",
+    "cpu_cache_admission_rejections",
     "cpu_cache_gib",
     "configuration",
 )
@@ -97,11 +90,14 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
-def layer_indices_arg(value: str) -> list[int]:
+def layer_fraction_arg(value: str) -> float:
     try:
-        return parse_layer_indices(value)
-    except LayerProfileError as exc:
+        fraction = float(value)
+    except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 < fraction <= 1:
+        raise argparse.ArgumentTypeError("must be greater than 0 and at most 1")
+    return fraction
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,36 +125,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consecutive decoder layers kept resident in one GPU group.",
     )
     parser.add_argument(
-        "--decoder-layer-count",
-        type=positive_int,
-        default=None,
+        "--max-gpu-layer-fraction",
+        type=layer_fraction_arg,
+        default=0.5,
         help=(
-            "Experimental reduced-depth mode: retain this many decoder layers. A supplied "
-            "Block Influence profile chooses them; otherwise AirLLM samples evenly."
+            "Maximum decoder-weight fraction simultaneously on GPU, including the next "
+            "CUDA-prefetched group; every model layer still executes."
         ),
-    )
-    parser.add_argument(
-        "--decoder-layer-indices",
-        type=layer_indices_arg,
-        default=None,
-        help="Explicit comma-separated source-layer indices to retain.",
-    )
-    parser.add_argument(
-        "--decoder-layer-profile",
-        type=Path,
-        default=None,
-        help="Block Influence JSON used for layer ranking and its measured quality floor.",
-    )
-    parser.add_argument(
-        "--allow-unsafe-layer-drop",
-        action="store_true",
-        help="Bypass a profile's quality floor for speed-only broken-output experiments.",
     )
     parser.add_argument(
         "--prefetch-groups",
         type=positive_int,
         default=1,
         help="Number of upcoming groups loaded into CPU memory ahead of execution.",
+    )
+    parser.add_argument(
+        "--cpu-prefetch-workers",
+        type=positive_int,
+        default=2,
+        help="Concurrent CPU shard-loading workers.",
     )
     parser.add_argument(
         "--no-prefetch",
@@ -177,8 +162,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bounded pinned CPU-RAM cache for layer shards; zero disables retention.",
     )
     parser.add_argument(
+        "--cpu-layer-cache-policy",
+        choices=("static", "lru"),
+        default="static",
+        help="Static hot-set retention avoids cyclic LRU thrashing on oversized models.",
+    )
+    parser.add_argument(
         "--persistent-gpu-residency",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Preload and retain the complete model when it fits in VRAM.",
     )
     parser.add_argument(
@@ -241,6 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=non_negative_int,
         default=1,
         help="Unrecorded generations on the first prompt batch after model load.",
+    )
+    parser.add_argument(
+        "--warmup-new-tokens",
+        type=positive_int,
+        default=None,
+        help="Tokens per warmup generation; defaults to --max-new-tokens.",
     )
     parser.add_argument(
         "--repeats",
@@ -607,6 +605,7 @@ def generate_once(
         "group_cpu_wait_seconds": runtime_stats.get("group_cpu_wait_seconds"),
         "group_gpu_load_seconds": runtime_stats.get("group_gpu_load_seconds"),
         "group_copy_wait_seconds": runtime_stats.get("group_copy_wait_seconds"),
+        "copy_stream_dependencies": runtime_stats.get("copy_stream_dependencies"),
         "group_compute_seconds": runtime_stats.get("group_compute_seconds"),
         "cuda_prefetched_groups": runtime_stats.get("cuda_prefetched_groups"),
         "resident_group_hits": runtime_stats.get("resident_group_hits"),
@@ -615,6 +614,9 @@ def generate_once(
         "cpu_cache_hits": runtime_stats.get("cpu_cache_hits"),
         "cpu_cache_misses": runtime_stats.get("cpu_cache_misses"),
         "cpu_cache_evictions": runtime_stats.get("cpu_cache_evictions"),
+        "cpu_cache_admission_rejections": runtime_stats.get(
+            "cpu_cache_admission_rejections"
+        ),
         "cpu_cache_gib": (
             runtime_stats.get("cpu_cache_bytes", 0) / (1024 ** 3)
             if runtime_stats else None
@@ -675,16 +677,14 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "model_path": str(args.model_path.expanduser()),
         "device_requested": args.device,
         "group_size": args.group_size,
-        "decoder_layer_count": args.decoder_layer_count,
-        "decoder_layer_indices": args.decoder_layer_indices,
-        "decoder_layer_profile": (
-            str(args.decoder_layer_profile) if args.decoder_layer_profile is not None else None
-        ),
-        "allow_unsafe_layer_drop": args.allow_unsafe_layer_drop,
+        "model_decoder_layers": "all checkpoint layers",
+        "max_gpu_layer_fraction": args.max_gpu_layer_fraction,
         "prefetch_groups": args.prefetch_groups,
+        "cpu_prefetch_workers": args.cpu_prefetch_workers,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "cpu_layer_cache_policy": args.cpu_layer_cache_policy,
         "persistent_gpu_residency": args.persistent_gpu_residency,
         "awq_backend": args.awq_backend,
         "cache_implementation": args.cache_implementation,
@@ -695,6 +695,7 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
         "max_new_tokens": args.max_new_tokens,
         "min_new_tokens": args.min_new_tokens,
         "warmup_runs": args.warmup,
+        "warmup_new_tokens": args.warmup_new_tokens or args.max_new_tokens,
         "repeats": args.repeats,
         "output_csv": str(args.output_csv),
         "output_json": str(args.output_json),
@@ -702,47 +703,10 @@ def dry_run_report(args: argparse.Namespace, batches: list[list[str]], source: s
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
-def resolve_decoder_layer_selection(args: argparse.Namespace) -> tuple[list[int] | None, dict | None]:
-    if args.decoder_layer_count is None and args.decoder_layer_indices is None:
-        return None, None
-
-    selected_count = args.decoder_layer_count
-    if args.decoder_layer_indices is not None:
-        if selected_count is None:
-            selected_count = len(args.decoder_layer_indices)
-            args.decoder_layer_count = selected_count
-        elif selected_count != len(args.decoder_layer_indices):
-            raise LayerProfileError(
-                "--decoder-layer-count must match --decoder-layer-indices length"
-            )
-
-    profile = load_layer_profile(args.decoder_layer_profile) \
-        if args.decoder_layer_profile is not None else None
-    if profile is not None:
-        profile_indices = select_profile_layers(
-            profile,
-            selected_count,
-            allow_unsafe=args.allow_unsafe_layer_drop,
-        )
-        if args.decoder_layer_indices is None:
-            return profile_indices, profile
-        if args.decoder_layer_indices != profile_indices and not args.allow_unsafe_layer_drop:
-            raise LayerProfileError(
-                "explicit layer indices differ from the calibrated profile; use "
-                "--allow-unsafe-layer-drop to run an unvalidated selection"
-            )
-    return args.decoder_layer_indices, profile
-
-
 def main() -> int:
     args = build_parser().parse_args()
     if args.min_new_tokens > args.max_new_tokens:
         raise SystemExit("--min-new-tokens cannot exceed --max-new-tokens")
-    try:
-        decoder_layer_indices, layer_profile = resolve_decoder_layer_selection(args)
-    except LayerProfileError as exc:
-        raise SystemExit(str(exc)) from exc
-    args.decoder_layer_indices = decoder_layer_indices
     prompts, prompt_source = read_prompts(args)
     batches, padded_count = build_prompt_batches(prompts, args.prompt_batch_size)
 
@@ -764,17 +728,14 @@ def main() -> int:
     print(f"model_path: {model_path}")
     print(f"device: {device}")
     print(f"group_size: {args.group_size}")
-    print(f"decoder_layer_count: {args.decoder_layer_count or 'all'}")
-    print(f"decoder_layer_selection: {args.decoder_layer_indices or 'all/even'}")
-    print(
-        "decoder_layer_profile: "
-        f"{layer_profile['profile_path'] if layer_profile is not None else 'none'}"
-    )
-    print(f"allow_unsafe_layer_drop: {args.allow_unsafe_layer_drop}")
+    print("model_decoder_layers: all checkpoint layers (never pruned)")
+    print(f"max_gpu_layer_fraction: {args.max_gpu_layer_fraction}")
     print(f"prefetch_groups: {args.prefetch_groups}")
+    print(f"cpu_prefetch_workers: {args.cpu_prefetch_workers}")
     print(f"prefetching: {not args.no_prefetch}")
     print(f"cuda_copy_stream: {not args.no_cuda_copy_stream}")
     print(f"cpu_layer_cache_gib: {args.cpu_layer_cache_gib}")
+    print(f"cpu_layer_cache_policy: {args.cpu_layer_cache_policy}")
     print(f"persistent_gpu_residency: {args.persistent_gpu_residency}")
     print(f"awq_backend: {args.awq_backend or 'checkpoint default'}")
     print(f"kv_cache: {args.cache_implementation}")
@@ -783,12 +744,13 @@ def main() -> int:
     model_kwargs: dict[str, Any] = {
         "device": str(device),
         "layers_per_gpu_group": args.group_size,
-        "decoder_layer_count": args.decoder_layer_count,
-        "decoder_layer_indices": args.decoder_layer_indices,
+        "max_gpu_layer_fraction": args.max_gpu_layer_fraction,
         "prefetch_groups": args.prefetch_groups,
+        "cpu_prefetch_workers": args.cpu_prefetch_workers,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "cpu_layer_cache_policy": args.cpu_layer_cache_policy,
         "persistent_gpu_residency": args.persistent_gpu_residency,
         "awq_backend": args.awq_backend,
     }
@@ -796,27 +758,21 @@ def main() -> int:
         model_kwargs["layer_shards_saving_path"] = str(args.layer_shards_path.expanduser())
     model = AutoModel.from_pretrained(str(model_path), **model_kwargs)
     initial_runtime_stats = model.get_runtime_stats()
-    if layer_profile is not None:
-        try:
-            validate_profile_identity(
-                layer_profile,
-                original_decoder_layer_count=initial_runtime_stats[
-                    "original_decoder_layer_count"
-                ],
-                resolved_model_path=model.model_local_path,
-            )
-        except LayerProfileError as exc:
-            model.close()
-            raise SystemExit(str(exc)) from exc
     print(
-        "active_decoder_layers: "
+        "model_decoder_layers_executed: "
         f"{initial_runtime_stats['decoder_layer_count']}/"
-        f"{initial_runtime_stats['original_decoder_layer_count']} "
-        f"source_indices={initial_runtime_stats['decoder_layer_indices']}"
+        f"{initial_runtime_stats['original_decoder_layer_count']} (100%)"
+    )
+    print(
+        "configured_peak_gpu_decoder_layers: "
+        f"{initial_runtime_stats['configured_peak_gpu_decoder_layers']}/"
+        f"{initial_runtime_stats['decoder_layer_count']} "
+        f"(limit {initial_runtime_stats['max_gpu_resident_decoder_layers']})"
     )
     encoded_batches = tokenize_batches(model.tokenizer, batches, args.max_input_tokens)
 
     print(f"warmup_runs: {args.warmup}")
+    warmup_new_tokens = args.warmup_new_tokens or args.max_new_tokens
     for _ in range(args.warmup):
         generate_once(
             torch,
@@ -824,8 +780,8 @@ def main() -> int:
             model.tokenizer,
             encoded_batches[0],
             device,
-            args.max_new_tokens,
-            args.min_new_tokens,
+            warmup_new_tokens,
+            warmup_new_tokens,
             args.cache_implementation,
         )
 
@@ -835,16 +791,20 @@ def main() -> int:
         "group_size": args.group_size,
         "decoder_layer_count": initial_runtime_stats["decoder_layer_count"],
         "original_decoder_layer_count": initial_runtime_stats["original_decoder_layer_count"],
-        "decoder_layer_indices": initial_runtime_stats["decoder_layer_indices"],
-        "decoder_layer_selection": initial_runtime_stats["decoder_layer_selection"],
-        "decoder_layer_profile": (
-            layer_profile["profile_path"] if layer_profile is not None else None
-        ),
-        "allow_unsafe_layer_drop": args.allow_unsafe_layer_drop,
+        "model_layers_executed": "all",
+        "max_gpu_layer_fraction": args.max_gpu_layer_fraction,
+        "max_gpu_resident_decoder_layers": initial_runtime_stats[
+            "max_gpu_resident_decoder_layers"
+        ],
+        "configured_peak_gpu_decoder_layers": initial_runtime_stats[
+            "configured_peak_gpu_decoder_layers"
+        ],
         "prefetch_groups": args.prefetch_groups,
+        "cpu_prefetch_workers": args.cpu_prefetch_workers,
         "prefetching": not args.no_prefetch,
         "cuda_copy_stream": not args.no_cuda_copy_stream,
         "cpu_layer_cache_gib": args.cpu_layer_cache_gib,
+        "cpu_layer_cache_policy": args.cpu_layer_cache_policy,
         "persistent_gpu_residency": args.persistent_gpu_residency,
         "awq_backend": args.awq_backend,
         "cache_implementation": args.cache_implementation,
@@ -857,6 +817,7 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "min_new_tokens": args.min_new_tokens,
         "warmup_runs": args.warmup,
+        "warmup_new_tokens": warmup_new_tokens,
         "repeats": args.repeats,
         "layer_shards_path": (
             str(args.layer_shards_path.expanduser()) if args.layer_shards_path is not None else None
@@ -877,7 +838,8 @@ def main() -> int:
             "gpu_temp_max_c": "maximum sampled GPU temperature",
             "group_cpu_wait_seconds": "time spent waiting for each requested group to arrive from the CPU prefetch path",
             "group_gpu_load_seconds": "time spent materializing requested group weights on the GPU",
-            "group_copy_wait_seconds": "handoff time blocked waiting for the CUDA copy stream",
+            "group_copy_wait_seconds": "host time blocked on CUDA copy completion; optimized runs should remain zero",
+            "copy_stream_dependencies": "groups whose compute stream waited asynchronously on an unfinished copy event",
             "group_compute_seconds": "time spent executing grouped layer modules",
             "cpu_cache_gib": "current bounded CPU layer-cache payload in GiB",
         },
@@ -918,6 +880,7 @@ def main() -> int:
                 f"cpu_wait {row['group_cpu_wait_seconds']:.3f}s, "
                 f"gpu_load {row['group_gpu_load_seconds']:.3f}s, "
                 f"copy_wait {row['group_copy_wait_seconds']:.3f}s, "
+                f"copy_dependencies {row['copy_stream_dependencies']}, "
                 f"compute {row['group_compute_seconds']:.3f}s"
             )
 

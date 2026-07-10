@@ -68,6 +68,7 @@
 
 ## Table of Contents
 
+* [Fork performance goal](#fork-performance-goal)
 * [Quick start](#quickstart)
 * [Model Compression](#model-compression---3x-inference-speed-up)
 * [Configurations](#configurations)
@@ -76,6 +77,28 @@
 * [Supported Models](#supported-models)
 * [Acknowledgement](#acknowledgement)
 * [FAQ](#faq)
+
+## Fork performance goal
+
+This fork optimizes tokens per second for models that are too large to remain
+fully resident on one GPU. Its non-negotiable execution contract is:
+
+- Every decoder layer from the checkpoint executes for every forward pass. This
+  fork does not prune, skip, replace, or delete trained model layers.
+- Decoder weights are divided into consecutive GPU groups, executed in original
+  order, and released after use.
+- The prepared benchmark keeps at most half of the model's decoder weights on
+  the GPU at once. That budget includes both the active group and a group being
+  copied concurrently by CUDA prefetch.
+- Performance work targets the highest correct-output TPS under that residency
+  budget through grouping, pinned CPU caching, asynchronous transfer, realistic
+  KV caching, and prompt batching.
+- In the prepared CUDA path, CPU RAM stores and stages weights; the GPU executes
+  the embedding, all decoder-layer math, final norm, and output head.
+
+For the 36-layer Qwen3 test model, the default is a 9-layer active group plus a
+9-layer prefetched group: at most 18/36 decoder-layer weights on GPU, while all
+36/36 layers execute. `--max-gpu-layer-fraction 0.5` enforces this at runtime.
 
 ## Quickstart
 
@@ -116,23 +139,15 @@ Then use the prepared launcher:
 ./scripts/run_qwen3_awq_marlin.sh
 ```
 
-It executes every model layer while keeping at most 12 consecutive decoder
-layers on the GPU at once. It also enables 8-group prefetch, a 16 GiB CPU-cache
-budget, a dedicated CUDA copy stream, dynamic KV, live stats, and 256 new tokens
-with a 40,704-token prompt cap. This is the large-model streaming path: changing
-the GPU group size changes residency and transfer batching, not model depth. Add
+It executes every model layer with 9-layer GPU groups. CUDA double buffering can
+hold the active 9-layer group and the next 9-layer group simultaneously, keeping
+the configured peak at 18/36 decoder layers. It also enables 8-group CPU
+prefetch, a 16 GiB pinned CPU-cache budget, a dedicated CUDA copy stream, dynamic
+KV, the streamed Triton AWQ kernel, live stats, and 512 new tokens with a
+40,448-token prompt cap. Changing the GPU group size changes residency and
+transfer batching, never model depth. Add
 `--max-new-tokens 64`, `--no-live-stats`, or any normal runner option to override
 the launcher defaults.
-
-For a small checkpoint that completely fits in VRAM, full residency and Marlin
-remain an explicit faster option:
-
-```bash
-./scripts/run_qwen3_awq_marlin.sh --persistent-gpu-residency
-```
-
-Do not use `--decoder-layer-count` to control VRAM residency. That experimental
-option removes trained blocks from the network and can destroy output quality.
 
 To reproduce the exact native 40,960-token context stress test and write a JSON
 report under `benchmarks/results/`, run:
@@ -141,17 +156,14 @@ report under `benchmarks/results/`, run:
 ./scripts/run_qwen3_awq_marlin.sh --context-limit-benchmark
 ```
 
-Persistent residency is intentionally opt-in: use it only when the checkpoint
-plus the required KV cache fit in VRAM. Ordinary grouped streaming remains the
-safe path for larger checkpoints.
-
-For the tested 12 GB RTX 5070 setup, keep 12 decoder layers resident, retain the
-complete Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next
-group on a dedicated CUDA stream, and use a realistic dynamic KV cache:
+For the tested 12 GB RTX 5070 setup, use 9-layer groups, retain the complete
+Qwen3-4B-AWQ shard set in a bounded pinned-RAM cache, transfer the next group on
+a dedicated CUDA stream, and use a realistic dynamic KV cache:
 
 ```bash
 .venv/bin/python scripts/run_qwen3_awq.py \
-  --layers-per-gpu-group 12 \
+  --layers-per-gpu-group 9 \
+  --max-gpu-layer-fraction 0.5 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
   --cache-implementation dynamic \
@@ -165,7 +177,8 @@ Prompt batching is supported by repeating `--prompt`, loading one prompt per lin
   --prompt "Explain CUDA streams" \
   --prompt "Explain KV caching" \
   --batch-size 2 \
-  --layers-per-gpu-group 12 \
+  --layers-per-gpu-group 9 \
+  --max-gpu-layer-fraction 0.5 \
   --prefetch-groups 2 \
   --cpu-layer-cache-gib 4 \
   --cache-implementation dynamic
@@ -177,6 +190,8 @@ group/layer/prefetch state. Use `--no-live-stats` for quiet output or
 `--no-cuda-copy-stream` for an A/B control.
 
 For repeatable comparisons across group sizes, prefetch depths, and prompt batch sizes, see [benchmarks/README.md](benchmarks/README.md).
+The latest strict half-residency measurements are recorded in
+[benchmarks/HALF_RESIDENCY_REPORT.md](benchmarks/HALF_RESIDENCY_REPORT.md).
 
 ### 1. Install package
 
@@ -268,13 +283,14 @@ When initialize the model, we support the following configurations:
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: overlap upcoming layer-shard loading with current-group compute. Enabled by default.
 * **layers_per_gpu_group**: consecutive decoder layers to keep resident on the GPU before releasing the group.
+* **max_gpu_layer_fraction**: optional hard cap on simultaneous GPU decoder-weight residency. CUDA-prefetched weights count toward the cap; this never changes how many model layers execute.
 * **prefetch_groups**: upcoming groups to stage in CPU memory.
+* **cpu_prefetch_workers**: concurrent CPU shard-loading workers; the prepared launcher uses two.
 * **cuda_copy_stream**: stage the immediate next group on a dedicated CUDA stream while the current group computes.
 * **cpu_layer_cache_gib**: bounded CPU-RAM budget for retaining layer shards across autoregressive forwards. Use `0` to disable retention.
+* **cpu_layer_cache_policy**: `static` keeps a stable hot set and avoids cyclic LRU thrashing when the model is larger than the cache; `lru` enables ordinary replacement.
 * **persistent_gpu_residency**: preload every group once and retain the complete model across decode steps. This removes per-token weight transfers but requires the checkpoint and KV cache to fit in VRAM.
 * **awq_backend**: select a GPTQModel AWQ kernel explicitly. `marlin` requires persistent GPU residency because its one-time repacked weights cannot be streamed back from raw AWQ shards.
-* **decoder_layer_count**: experimental reduced-depth mode. Retain this many decoder blocks with compact KV-cache indexing. Without explicit indices, layers are sampled evenly; aggressive untrained pruning can destroy output quality.
-* **decoder_layer_indices**: explicit increasing source-layer indices selected by a calibration profile or other pruning policy. The prepared Qwen launcher uses a measured Block Influence profile and refuses layer counts below its quality floor unless explicitly overridden.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS

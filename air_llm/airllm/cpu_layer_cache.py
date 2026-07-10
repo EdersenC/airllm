@@ -27,6 +27,7 @@ class CPULayerCacheStats:
     hits: int
     misses: int
     evictions: int
+    admission_rejections: int
     bytes: int
     max_bytes: int
     entries: int
@@ -42,6 +43,9 @@ class CPULayerCache:
         max_gib: Convenience alternative to ``max_bytes`` using binary GiB.
         pin_memory: Pin cached CPU tensors when CUDA is available, allowing a
             later CPU-to-CUDA transfer to use ``non_blocking=True``.
+        admission_policy: ``lru`` evicts old entries for new ones. ``static``
+            retains the first hot set that fits and rejects later overflow,
+            preventing a repeated sequential model scan from thrashing the cache.
 
     The cache stores tensor references, rather than cloning tensor contents, so
     caching does not briefly double a layer's RAM use.  Callers must therefore
@@ -56,6 +60,7 @@ class CPULayerCache:
         max_bytes: Optional[int] = None,
         max_gib: Optional[float] = None,
         pin_memory: bool = False,
+        admission_policy: str = "lru",
     ) -> None:
         if (max_bytes is None) == (max_gib is None):
             raise ValueError("provide exactly one of max_bytes or max_gib")
@@ -74,12 +79,16 @@ class CPULayerCache:
 
         self._max_bytes = max_bytes
         self._pin_memory = bool(pin_memory)
+        if admission_policy not in {"lru", "static"}:
+            raise ValueError("admission_policy must be 'lru' or 'static'")
+        self._admission_policy = admission_policy
         self._entries: "OrderedDict[Hashable, LayerStateDict]" = OrderedDict()
         self._entry_bytes: Dict[Hashable, int] = {}
         self._bytes = 0
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._admission_rejections = 0
         self._closed = False
         self._lock = RLock()
         self._inflight: Dict[Hashable, Future[LayerStateDict]] = {}
@@ -197,6 +206,7 @@ class CPULayerCache:
                 hits=self._hits,
                 misses=self._misses,
                 evictions=self._evictions,
+                admission_rejections=self._admission_rejections,
                 bytes=self._bytes,
                 max_bytes=self._max_bytes,
                 entries=len(self._entries),
@@ -218,6 +228,18 @@ class CPULayerCache:
         previous = self._entries.pop(key, None)
         if previous is not None:
             self._bytes -= self._entry_bytes.pop(key)
+
+        if self._admission_policy == "static" and self._bytes + entry_bytes > self._max_bytes:
+            if previous is not None:
+                self._entries[key] = previous
+                previous_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in previous.values()
+                )
+                self._entry_bytes[key] = previous_bytes
+                self._bytes += previous_bytes
+            self._admission_rejections += 1
+            return False
 
         while self._bytes + entry_bytes > self._max_bytes:
             evicted_key, _ = self._entries.popitem(last=False)

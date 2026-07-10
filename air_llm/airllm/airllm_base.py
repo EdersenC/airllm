@@ -2,6 +2,7 @@
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
+import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -120,8 +121,8 @@ class AirLLMBaseModel:
                  layers_per_gpu_group=1, prefetch_groups=1, show_live_stats=False,
                  live_stats_interval=0.25, cuda_copy_stream=True,
                  cpu_layer_cache_gib=0.0, persistent_gpu_residency=False,
-                 awq_backend=None, decoder_layer_count=None,
-                 decoder_layer_indices=None):
+                 awq_backend=None, max_gpu_layer_fraction=None,
+                 cpu_prefetch_workers=2, cpu_layer_cache_policy="static"):
         """
         Parameters
         ----------
@@ -152,6 +153,8 @@ class AirLLMBaseModel:
             embedding, final norm, and lm_head are always kept as separate edge groups.
         prefetch_groups: int, optional
             number of upcoming GPU groups to load into CPU memory ahead of execution.
+        cpu_prefetch_workers: int, optional
+            number of concurrent CPU shard-loading workers.
         show_live_stats: bool, optional
             print throttled group/layer/prefetch progress to stderr during generation.
         live_stats_interval: float, optional
@@ -163,6 +166,9 @@ class AirLLMBaseModel:
             bounded CPU RAM budget for retaining layer shards across forward passes.
             Cached tensors are pinned when prefetching is enabled so the CUDA copy
             stream can reuse them without another disk read or staging copy.
+        cpu_layer_cache_policy: str, optional
+            ``static`` retains the first hot set that fits, avoiding LRU thrashing when a
+            repeatedly scanned model is larger than the cache. ``lru`` enables replacement.
         persistent_gpu_residency: bool, optional
             preload every streaming group and keep the complete model on the GPU across
             forward passes. This is substantially faster for models that fit in VRAM but
@@ -172,15 +178,10 @@ class AirLLMBaseModel:
             explicit GPTQModel kernel for an AWQ checkpoint. ``marlin`` requires persistent
             GPU residency because its one-time weight repack is not compatible with eviction
             and reloading raw AWQ layer shards.
-        decoder_layer_count: int, optional
-            experimental reduced-depth mode. Keep this many decoder layers, sampled evenly
-            across the original stack while retaining the first and last blocks. The retained
-            layers are compacted and their KV-cache indices are renumbered. Omitting this value
-            executes the complete checkpoint.
-        decoder_layer_indices: list[int], optional
-            explicit, strictly increasing source-layer indices to retain. This overrides even
-            sampling and is intended for calibrated importance profiles. When
-            ``decoder_layer_count`` is also supplied, it must match the list length.
+        max_gpu_layer_fraction: float, optional
+            maximum fraction of decoder-layer weights that may be on the GPU simultaneously.
+            The limit includes both the active group and a group being copied on the CUDA
+            prefetch stream. It changes residency only: every checkpoint layer always executes.
         """
 
         if not isinstance(layers_per_gpu_group, int) or isinstance(layers_per_gpu_group, bool) \
@@ -189,35 +190,25 @@ class AirLLMBaseModel:
         if not isinstance(prefetch_groups, int) or isinstance(prefetch_groups, bool) \
                 or prefetch_groups < 1:
             raise ValueError("prefetch_groups must be a positive integer")
+        if not isinstance(cpu_prefetch_workers, int) or isinstance(cpu_prefetch_workers, bool) \
+                or cpu_prefetch_workers < 1:
+            raise ValueError("cpu_prefetch_workers must be a positive integer")
         if live_stats_interval < 0:
             raise ValueError("live_stats_interval must be non-negative")
         if isinstance(cpu_layer_cache_gib, bool) or not isinstance(
                 cpu_layer_cache_gib, (int, float)) or cpu_layer_cache_gib < 0:
             raise ValueError("cpu_layer_cache_gib must be a non-negative number")
+        if cpu_layer_cache_policy not in {"static", "lru"}:
+            raise ValueError("cpu_layer_cache_policy must be 'static' or 'lru'")
         if not isinstance(persistent_gpu_residency, bool):
             raise TypeError("persistent_gpu_residency must be a boolean")
-        if decoder_layer_count is not None and (
-                not isinstance(decoder_layer_count, int)
-                or isinstance(decoder_layer_count, bool)
-                or decoder_layer_count < 1):
-            raise ValueError("decoder_layer_count must be a positive integer or None")
-        if decoder_layer_indices is not None:
-            if not isinstance(decoder_layer_indices, (list, tuple)) \
-                    or not decoder_layer_indices:
-                raise ValueError("decoder_layer_indices must be a non-empty list or tuple")
-            if any(
-                    not isinstance(index, int) or isinstance(index, bool) or index < 0
-                    for index in decoder_layer_indices):
-                raise ValueError("decoder_layer_indices must contain non-negative integers")
-            decoder_layer_indices = list(decoder_layer_indices)
-            if decoder_layer_indices != sorted(set(decoder_layer_indices)):
-                raise ValueError("decoder_layer_indices must be unique and strictly increasing")
-            if decoder_layer_count is None:
-                decoder_layer_count = len(decoder_layer_indices)
-            elif decoder_layer_count != len(decoder_layer_indices):
-                raise ValueError(
-                    "decoder_layer_count must match the length of decoder_layer_indices"
-                )
+        if max_gpu_layer_fraction is not None and (
+                isinstance(max_gpu_layer_fraction, bool)
+                or not isinstance(max_gpu_layer_fraction, (int, float))
+                or not math.isfinite(max_gpu_layer_fraction)
+                or max_gpu_layer_fraction <= 0
+                or max_gpu_layer_fraction > 1):
+            raise ValueError("max_gpu_layer_fraction must be greater than 0 and at most 1")
         if awq_backend is not None:
             if not isinstance(awq_backend, str) or not awq_backend.strip():
                 raise TypeError("awq_backend must be a non-empty string or None")
@@ -246,10 +237,13 @@ class AirLLMBaseModel:
         self.hf_token = hf_token
         self.layers_per_gpu_group = layers_per_gpu_group
         self.prefetch_groups = prefetch_groups
+        self.cpu_prefetch_workers = cpu_prefetch_workers
+        self.cpu_layer_cache_policy = cpu_layer_cache_policy
         self.persistent_gpu_residency = persistent_gpu_residency
         self.awq_backend = awq_backend
-        self.requested_decoder_layer_count = decoder_layer_count
-        self.requested_decoder_layer_indices = decoder_layer_indices
+        self.max_gpu_layer_fraction = (
+            float(max_gpu_layer_fraction) if max_gpu_layer_fraction is not None else None
+        )
         self._quantizer_postprocess_started = False
         self._quantizer_postprocessed = False
 
@@ -303,7 +297,10 @@ class AirLLMBaseModel:
         if self.compression is not None and self.prefetching:
             print("prefetching is not supported together with compression for now; disabling prefetching.")
             self.prefetching = False
-        self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
+        self._executor = (
+            ThreadPoolExecutor(max_workers=self.cpu_prefetch_workers)
+            if self.prefetching else None
+        )
         self._prefetch_futures = {}
         self.cuda_copy_stream = bool(
             cuda_copy_stream and self.prefetching and self.device.type == "cuda")
@@ -312,10 +309,15 @@ class AirLLMBaseModel:
             ThreadPoolExecutor(max_workers=1) if self.cuda_copy_stream else None)
         self._gpu_prefetch_futures = {}
         self._group_cpu_sources = {}
-        self._group_copy_events = {}
+        self._pending_copy_timings = []
         self.cpu_layer_cache = CPULayerCache(
             max_gib=float(cpu_layer_cache_gib),
             pin_memory=self.prefetching and self.device.type == "cuda",
+            admission_policy=self.cpu_layer_cache_policy,
+        )
+        self.cpu_prefetch_budget_bytes = min(
+            self.cpu_layer_cache.max_bytes,
+            4 * 1024 ** 3,
         )
         self._resident_group_ids = set()
         self._forward_count = 0
@@ -326,16 +328,12 @@ class AirLLMBaseModel:
 
         self.init_model()
 
-        self._configure_decoder_layer_selection()
+        self._inspect_decoder_stack()
 
         self.layer_names = [self.layer_names_dict['embed']] + \
                            [f'{self.layer_names_dict["layer_prefix"]}.{i}'
-                            for i in self.decoder_layer_indices] + \
+                            for i in range(self.decoder_layer_count)] + \
                            [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
-        self.runtime_layer_names = [self.layer_names_dict['embed']] + \
-                                   [f'{self.layer_names_dict["layer_prefix"]}.{i}'
-                                    for i in range(self.decoder_layer_count)] + \
-                                   [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
 
         self.max_seq_len = max_seq_len
 
@@ -382,117 +380,26 @@ class AirLLMBaseModel:
 
     # ---- model construction -----------------------------------------------------------------
 
-    @staticmethod
-    def _select_evenly_spaced_layers(original_count, selected_count):
-        """Return deterministic source indices, preserving both ends when possible."""
-        if not isinstance(original_count, int) or isinstance(original_count, bool) \
-                or original_count < 1:
-            raise ValueError("original decoder layer count must be a positive integer")
-        if selected_count is None:
-            selected_count = original_count
-        if not isinstance(selected_count, int) or isinstance(selected_count, bool) \
-                or selected_count < 1:
-            raise ValueError("decoder_layer_count must be a positive integer or None")
-        if selected_count > original_count:
-            raise ValueError(
-                f"decoder_layer_count={selected_count} exceeds the checkpoint's "
-                f"{original_count} decoder layers"
-            )
-        if selected_count == original_count:
-            return list(range(original_count))
-        if selected_count == 1:
-            return [original_count // 2]
-
-        # Integer round-half-up avoids floating-point drift and guarantees unique, ordered
-        # indices because the spacing is at least one whenever selected_count <= original_count.
-        denominator = selected_count - 1
-        rounding = denominator // 2
-        return [
-            (position * (original_count - 1) + rounding) // denominator
-            for position in range(selected_count)
-        ]
-
-    def _configure_decoder_layer_selection(self):
-        """Compact an evenly sampled decoder stack and repair cache/config indexing."""
+    def _inspect_decoder_stack(self):
+        """Record the complete decoder stack; streaming never prunes checkpoint layers."""
         prefix_parts = self.layer_names_dict["layer_prefix"].split(".")
         parent = self.model
         for attr_name in prefix_parts[:-1]:
             parent = getattr(parent, attr_name)
-        layers_attr = prefix_parts[-1]
-        original_layers = getattr(parent, layers_attr)
-        original_count = len(original_layers)
-        if self.requested_decoder_layer_indices is None:
-            selected_indices = self._select_evenly_spaced_layers(
-                original_count, self.requested_decoder_layer_count)
-            self.decoder_layer_selection = "all" if len(selected_indices) == original_count \
-                else "even"
-        else:
-            selected_indices = list(self.requested_decoder_layer_indices)
-            if selected_indices[-1] >= original_count:
-                raise ValueError(
-                    f"decoder_layer_indices contains {selected_indices[-1]}, but the checkpoint "
-                    f"only has {original_count} decoder layers"
-                )
-            self.decoder_layer_selection = "explicit"
-
-        self.original_decoder_layer_count = original_count
-        self.decoder_layer_indices = selected_indices
-        self.decoder_layer_count = len(selected_indices)
-        if self.decoder_layer_count == original_count:
-            return
-
-        if not isinstance(original_layers, torch.nn.ModuleList):
-            raise TypeError(
-                "experimental reduced-depth mode requires decoder layers stored in "
-                "torch.nn.ModuleList"
-            )
-
-        layer_types = getattr(self.config, "layer_types", None)
-        if layer_types is not None:
-            if len(layer_types) != original_count:
-                raise ValueError(
-                    "experimental reduced-depth mode cannot safely compact a model whose "
-                    "config.layer_types length differs from num_hidden_layers"
-                )
-            self.config.layer_types = [layer_types[index] for index in selected_indices]
-
-        selected_layers = torch.nn.ModuleList(
-            [original_layers[index] for index in selected_indices]
+        decoder_layers = getattr(parent, prefix_parts[-1])
+        self.decoder_layer_count = len(decoder_layers)
+        if self.decoder_layer_count < 1:
+            raise ValueError("checkpoint must contain at least one decoder layer")
+        self.original_decoder_layer_count = self.decoder_layer_count
+        self.decoder_layer_indices = list(range(self.decoder_layer_count))
+        self.decoder_layer_selection = "all"
+        self.max_gpu_resident_decoder_layers = (
+            self.decoder_layer_count
+            if self.max_gpu_layer_fraction is None
+            else max(1, math.floor(
+                self.decoder_layer_count * self.max_gpu_layer_fraction
+            ))
         )
-        setattr(parent, layers_attr, selected_layers)
-        self.config.num_hidden_layers = self.decoder_layer_count
-        self.model.config.num_hidden_layers = self.decoder_layer_count
-
-        # DynamicCache and StaticCache both expect compact zero-based layer indices. Attention
-        # implementations commonly store the source index on a nested module (Qwen uses
-        # self_attn.layer_idx), so update every integer marker inside each retained block.
-        for runtime_index, decoder_layer in enumerate(selected_layers):
-            for module in decoder_layer.modules():
-                if type(getattr(module, "layer_idx", None)) is int:
-                    module.layer_idx = runtime_index
-
-        selected_layer_types = getattr(self.config, "layer_types", None)
-        if hasattr(parent, "has_sliding_layers") and selected_layer_types is not None:
-            parent.has_sliding_layers = "sliding_attention" in selected_layer_types
-
-    def _remap_layer_state_dict(self, layer_index, state_dict):
-        """Map an original checkpoint layer prefix onto its compact runtime position."""
-        source_prefix = self.layer_names[layer_index]
-        runtime_prefix = self.runtime_layer_names[layer_index]
-        if source_prefix == runtime_prefix:
-            return state_dict
-
-        source_with_separator = source_prefix + "."
-        remapped = {}
-        for param_name, value in state_dict.items():
-            if param_name == source_prefix:
-                runtime_name = runtime_prefix
-            elif param_name.startswith(source_with_separator):
-                runtime_name = runtime_prefix + param_name[len(source_prefix):]
-            else:
-                runtime_name = param_name
-            remapped[runtime_name] = value
-        return remapped
 
     def init_model(self):
         # Build the real model on meta (no memory). include_buffers=False so non-persistent
@@ -515,9 +422,12 @@ class AirLLMBaseModel:
         quantization_config = getattr(self.config, "quantization_config", None)
         if quantization_config is not None:
             self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
+            gpu_only_streaming_kernel = self.awq_backend in {"gemm_triton"}
             device_map = (
                 {"": self.running_device}
-                if self.persistent_gpu_residency else self.hf_quantizer.update_device_map(None)
+                if self.device.type == "cuda"
+                and (self.persistent_gpu_residency or gpu_only_streaming_kernel)
+                else self.hf_quantizer.update_device_map(None)
             )
             self.hf_quantizer.preprocess_model(model=self.model, device_map=device_map)
             self.model.hf_quantizer = self.hf_quantizer
@@ -654,12 +564,34 @@ class AirLLMBaseModel:
         self.tie_word_embeddings = bool(getattr(self.config, "tie_word_embeddings", False))
         self._resident_embedding_moved = []
 
+        self._streaming_groups = self._build_streaming_groups(
+            n, self.tie_word_embeddings, self.layers_per_gpu_group)
+        self.configured_peak_gpu_decoder_layers = self._peak_decoder_layer_residency(
+            self._streaming_groups,
+            self.decoder_layer_count,
+            cuda_copy_stream=self.cuda_copy_stream,
+            persistent_gpu_residency=self.persistent_gpu_residency,
+        )
+        if self.configured_peak_gpu_decoder_layers \
+                > self.max_gpu_resident_decoder_layers:
+            copy_multiplier = 2 if self.cuda_copy_stream else 1
+            recommended_group_size = max(
+                1, self.max_gpu_resident_decoder_layers // copy_multiplier)
+            raise ValueError(
+                f"layers_per_gpu_group={self.layers_per_gpu_group} with "
+                f"cuda_copy_stream={self.cuda_copy_stream} can place up to "
+                f"{self.configured_peak_gpu_decoder_layers}/{self.decoder_layer_count} "
+                "decoder layers on the GPU at once, exceeding the configured limit of "
+                f"{self.max_gpu_resident_decoder_layers}. Use "
+                f"layers_per_gpu_group<={recommended_group_size}, disable CUDA copy overlap, "
+                "or explicitly raise max_gpu_layer_fraction. Every model layer will still "
+                "execute."
+            )
+
         if self.tie_word_embeddings:
             embed_state = self.load_layer_to_cpu(self.layer_names[0])
             self._resident_embedding_moved = self.move_layer_to_device(embed_state)
             self.model.tie_weights()
-        self._streaming_groups = self._build_streaming_groups(
-            n, self.tie_word_embeddings, self.layers_per_gpu_group)
         self._streamed_indices = [idx for group in self._streaming_groups for idx in group]
 
         self._streamed_set = set(self._streamed_indices)
@@ -680,6 +612,13 @@ class AirLLMBaseModel:
             module._airllm_idx = idx
             self._streaming_hook_handles.append(module.register_forward_pre_hook(self._pre_hook))
             self._streaming_hook_handles.append(module.register_forward_hook(self._post_hook))
+
+        # Begin loading the first group before tokenization/generation reaches its hook. Two CPU
+        # workers can also prepare the following group, shortening cold-start stalls without
+        # changing the bounded cache or GPU residency budget.
+        if not self.persistent_gpu_residency:
+            self._schedule_group_prefetch(-1)
+            self._schedule_cuda_group_prefetch(-1)
 
     def _remove_streaming_hooks(self):
         for handle in self._streaming_hook_handles:
@@ -754,11 +693,50 @@ class AirLLMBaseModel:
             groups.append([layer_count - 1])
         return groups
 
+    @staticmethod
+    def _peak_decoder_layer_residency(
+            groups, decoder_layer_count, cuda_copy_stream, persistent_gpu_residency):
+        """Return the maximum decoder weights simultaneously materialized on the GPU."""
+        if persistent_gpu_residency:
+            return decoder_layer_count
+
+        decoder_counts = [
+            sum(1 <= layer_index <= decoder_layer_count for layer_index in group)
+            for group in groups
+        ]
+        peak = max(decoder_counts, default=0)
+        if cuda_copy_stream:
+            peak = max(
+                [peak] + [
+                    current_count + next_count
+                    for current_count, next_count in zip(
+                        decoder_counts, decoder_counts[1:]
+                    )
+                ]
+            )
+        return peak
+
     def _load_group_to_cpu(self, group_id):
         return [
             self.load_layer_to_cpu(self.layer_names[idx])
             for idx in self._streaming_groups[group_id]
         ]
+
+    def _estimated_group_shard_bytes(self, group_id):
+        total_bytes = 0
+        try:
+            group = self._streaming_groups[group_id]
+            checkpoint_path = self.checkpoint_path
+            layer_names = self.layer_names
+        except AttributeError:
+            return None
+        for idx in group:
+            shard_path = Path(checkpoint_path) / f"{layer_names[idx]}.safetensors"
+            try:
+                total_bytes += shard_path.stat().st_size
+            except OSError:
+                return None
+        return total_bytes
 
     def _schedule_group_prefetch(self, group_id):
         if not self.prefetching or group_id is None:
@@ -767,10 +745,34 @@ class AirLLMBaseModel:
             len(self._streaming_groups),
             group_id + 1 + self.prefetch_groups,
         )
+        retained_group_ids = (
+            set(self._prefetch_futures)
+            | set(getattr(self, "_gpu_prefetch_futures", {}))
+            | set(getattr(self, "_group_cpu_sources", {}))
+        )
+        prefetch_budget_bytes = getattr(self, "cpu_prefetch_budget_bytes", None)
+        reserved_bytes = 0 if prefetch_budget_bytes is None else sum(
+            self._estimated_group_shard_bytes(retained_group_id) or 0
+            for retained_group_id in retained_group_ids
+        )
         for next_group_id in range(group_id + 1, last_group_id):
-            if next_group_id not in self._prefetch_futures:
+            if next_group_id not in retained_group_ids:
+                estimated_bytes = (
+                    None if prefetch_budget_bytes is None
+                    else self._estimated_group_shard_bytes(next_group_id)
+                )
+                is_immediate = next_group_id == group_id + 1
+                if prefetch_budget_bytes is not None \
+                        and estimated_bytes is None and not is_immediate:
+                    break
+                if prefetch_budget_bytes is not None and not is_immediate and (
+                        prefetch_budget_bytes == 0
+                        or reserved_bytes + estimated_bytes > prefetch_budget_bytes):
+                    break
                 self._prefetch_futures[next_group_id] = self._executor.submit(
                     self._load_group_to_cpu, next_group_id)
+                reserved_bytes += estimated_bytes or 0
+                retained_group_ids.add(next_group_id)
 
     def _take_group_from_prefetch(self, group_id):
         if self.prefetching and group_id in self._prefetch_futures:
@@ -799,8 +801,7 @@ class AirLLMBaseModel:
         try:
             for idx, state_dict in zip(expected_layers, state_dicts):
                 module = self.layers[idx]
-                runtime_state_dict = self._remap_layer_state_dict(idx, state_dict)
-                module._airllm_moved = self.move_layer_to_device(runtime_state_dict)
+                module._airllm_moved = self.move_layer_to_device(state_dict)
                 loaded_modules.append(module)
         except Exception:
             for module in loaded_modules:
@@ -864,19 +865,31 @@ class AirLLMBaseModel:
 
         end_event = prepared["end_event"]
         current_stream = torch.cuda.current_stream(self.device)
+        copy_was_ready = end_event.query()
         current_stream.wait_event(end_event)
-        copy_wait_started = time.perf_counter()
-        end_event.synchronize()
-        self._runtime_stats["group_copy_wait_seconds"] += time.perf_counter() - copy_wait_started
-        self._runtime_stats["group_gpu_load_seconds"] += (
-            prepared["start_event"].elapsed_time(end_event) / 1000.0)
+        if not copy_was_ready:
+            self._runtime_stats["copy_stream_dependencies"] += 1
+        self._collect_completed_copy_timings()
+        self._pending_copy_timings.append((prepared["start_event"], end_event))
         self._record_group_on_stream(group_id, current_stream)
         self._group_cpu_sources[group_id] = prepared["state_dicts"]
-        self._group_copy_events[group_id] = end_event
         self._runtime_stats["groups_loaded"] += 1
         self._runtime_stats["cuda_prefetched_groups"] += 1
         self._resident_group_ids.add(group_id)
         return True, None
+
+    def _collect_completed_copy_timings(self, synchronize=False):
+        """Accumulate CUDA copy durations without stalling the host on the hot path."""
+        pending = []
+        for start_event, end_event in getattr(self, "_pending_copy_timings", ()):
+            if synchronize:
+                end_event.synchronize()
+            if end_event.query():
+                self._runtime_stats["group_gpu_load_seconds"] += (
+                    start_event.elapsed_time(end_event) / 1000.0)
+            else:
+                pending.append((start_event, end_event))
+        self._pending_copy_timings = pending
 
     def _prefetch_status(self):
         if not self._prefetch_futures and not self._gpu_prefetch_futures:
@@ -911,7 +924,6 @@ class AirLLMBaseModel:
     def _unload_group(self, group_id):
         self._release_group_modules(group_id)
         self._group_cpu_sources.pop(group_id, None)
-        self._group_copy_events.pop(group_id, None)
         self._resident_group_ids.discard(group_id)
 
     def _release_group_modules(self, group_id):
@@ -973,7 +985,7 @@ class AirLLMBaseModel:
             # redundant. Releasing them returns the pinned cache budget to the OS while the
             # transformed GPU parameters remain available for every decode step.
             self._group_cpu_sources.clear()
-            self._group_copy_events.clear()
+            self._collect_completed_copy_timings(synchronize=True)
             self.cpu_layer_cache.clear()
             self._remove_streaming_hooks()
             self._install_persistent_runtime_hooks()
@@ -1036,6 +1048,7 @@ class AirLLMBaseModel:
             "group_copy_wait_seconds": 0.0,
             "group_compute_seconds": 0.0,
             "cuda_prefetched_groups": 0,
+            "copy_stream_dependencies": 0,
             "resident_group_hits": 0,
         }
         self._group_compute_started = {}
@@ -1062,7 +1075,11 @@ class AirLLMBaseModel:
                 continue
             if prepared.get("async"):
                 prepared["end_event"].synchronize()
+                self._runtime_stats["group_gpu_load_seconds"] += (
+                    prepared["start_event"].elapsed_time(prepared["end_event"]) / 1000.0
+                )
                 self._release_group_modules(group_id)
+        self._collect_completed_copy_timings(synchronize=True)
 
     def close(self):
         """Release resident weights and stop the CPU prefetch worker."""
@@ -1119,6 +1136,7 @@ class AirLLMBaseModel:
 
     def get_runtime_stats(self):
         """Return timing counters for the most recent generation call."""
+        self._collect_completed_copy_timings()
         cache_stats = self.cpu_layer_cache.stats()
         return {
             **self._runtime_stats,
@@ -1128,7 +1146,11 @@ class AirLLMBaseModel:
             "decoder_layer_indices": list(self.decoder_layer_indices),
             "decoder_layer_selection": self.decoder_layer_selection,
             "layers_per_gpu_group": self.layers_per_gpu_group,
+            "max_gpu_layer_fraction": self.max_gpu_layer_fraction,
+            "max_gpu_resident_decoder_layers": self.max_gpu_resident_decoder_layers,
+            "configured_peak_gpu_decoder_layers": self.configured_peak_gpu_decoder_layers,
             "prefetch_groups": self.prefetch_groups,
+            "cpu_prefetch_workers": self.cpu_prefetch_workers,
             "cuda_copy_stream": self.cuda_copy_stream,
             "persistent_gpu_residency": self.persistent_gpu_residency,
             "persistent_groups_preloaded": (
@@ -1140,12 +1162,15 @@ class AirLLMBaseModel:
             "cpu_cache_hits": cache_stats.hits,
             "cpu_cache_misses": cache_stats.misses,
             "cpu_cache_evictions": cache_stats.evictions,
+            "cpu_cache_admission_rejections": cache_stats.admission_rejections,
             "cpu_cache_bytes": cache_stats.bytes,
             "cpu_cache_max_bytes": cache_stats.max_bytes,
+            "cpu_prefetch_budget_bytes": self.cpu_prefetch_budget_bytes,
             "cpu_cache_entries": cache_stats.entries,
         }
 
     def generate(self, *args, **kwargs):
+        self._collect_completed_copy_timings(synchronize=True)
         self._forward_count = 0
         self._live_batch_size = "?"
         self._live_sequence_length = "?"
